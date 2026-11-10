@@ -8,6 +8,10 @@
 - Related repository: https://github.com/trumank/patternsleuth; working branch `feature/memory-testkit` at `afbfd00ef0541434f1aa9549dd7eb5e73ac5f12e`, with uncommitted helper changes. The dependency uses the Jacoby6000 fork.
 - Source: user and build agent, session `ses_e3e9599b6ffeKmKK1iV1c4j1D5`, through response `msg_1c2c47353001q38TMK9LcOtk9K`. Earlier history is compacted.
 
+## Subsequent developments (2026-11-09)
+
+The statements below that the upstream helpers are uncommitted and unavailable on the dependency branch are superseded: they were committed and pushed. See [upstream helper publication](2026-11-09-upstream-helper-publication.md). Extraction completion remains unverified.
+
 ## Decision and context
 
 The user chose BinaryBloodhound as a separate repository for the binary matcher library and requested a Cargo dependency on PatternSleuth's `feature/memory-testkit` branch. The package is `binary_bloodhound`. The matcher code was copied from PatternSleuth's matcher branch, not removed from upstream master.
