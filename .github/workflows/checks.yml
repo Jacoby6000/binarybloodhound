@@ -1,0 +1,51 @@
+name: Rust checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: |
+          cargo fmt --all -- --check
+          rustfmt --check src/tests/shared.rs
+
+  check:
+    name: Check (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            args: ""
+          - name: all features
+            args: --all-features
+          - name: PE only
+            args: --no-default-features --features image-pe
+          - name: ELF only
+            args: --no-default-features --features image-elf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Typecheck
+        run: cargo typecheck ${{ matrix.args }}
+      - name: Lint
+        run: cargo lint ${{ matrix.args }}

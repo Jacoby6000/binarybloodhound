@@ -177,6 +177,7 @@ impl<'scope> BinaryMatcher<'scope> {
 
     /// Build and evaluate another source matcher from the entire result vector.
     /// Runs even on empty results; inner errors skip the callback.
+    #[allow(clippy::should_implement_trait)] // Submatcher composition, not subtraction.
     pub fn sub<F>(self, func: F) -> Self
     where
         F: Fn(Vec<u64>) -> Result<BinaryMatcher<'scope>> + Send + Sync + 'scope,

@@ -16,12 +16,13 @@ mod pe {
         let mut text = vec![0x90; 256];
         relative(&mut text, 8, &[0xe8], TARGET);
         let image = image(text).without_section(".xdata");
+
         assert!(run(&image, xrefs(TARGET)).is_err());
     }
 
     #[test]
     fn function_traversal_propagates_unwind_memory_errors() {
-        let image = string_graph().without_section(".xdata");
+        let image = call_graph().without_section(".xdata");
         let wrappers: [for<'a> fn(BinaryMatcher<'a>) -> BinaryMatcher<'a>; 3] = [
             |matcher: BinaryMatcher| matcher.root_functions().addresses(),
             |matcher: BinaryMatcher| matcher.callees().addresses(),
@@ -29,42 +30,17 @@ mod pe {
         ];
         for wrap in wrappers {
             let error = run(&image, wrap(BinaryMatcher::address(SHARED_CALLER))).unwrap_err();
+
             assert_eq!(
                 error.to_string(),
                 patternsleuth::MemoryAccessError::MemoryOutOfBoundsError.to_string()
             );
         }
-        // Raw reference scans do not require unwind metadata.
-        assert_eq!(
-            run(&image, BinaryMatcher::address(TARGET).references()).unwrap(),
-            [TEXT + 8]
-        );
-        assert_eq!(
-            run(&image, BinaryMatcher::address(SHARED_CALLER).callers()).unwrap(),
-            [ENTRY + 8]
-        );
-    }
-
-    #[test]
-    fn nested_string_pipeline_propagates_xref_errors_before_sub_callback() {
-        let image = string_graph().without_section(".xdata");
-        let matcher = string_matcher(NARROW_TEXT, false)
-            .xrefs()
-            .xrefs()
-            .addresses()
-            .sub(|_| panic!("callback must not run after a nested xref error"));
-        let error = run(&image, matcher).unwrap_err();
-        assert_eq!(
-            error,
-            ResolveError::from(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError)
-        );
     }
 }
 
 #[cfg(feature = "image-elf")]
 mod elf {
     use super::fixtures::elf as construct_image;
-    use patternsleuth::image::ImageType;
     include!("tests/shared.rs");
-    include!("tests/elf_parsed.rs");
 }

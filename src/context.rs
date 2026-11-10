@@ -196,6 +196,7 @@ impl<'scope, I: Send + 'scope> WithContext<'scope, I, Vec<u64>> {
 
 impl<'scope> WithContext<'scope, (), Vec<u64>> {
     /// Build and resolve a new source from `(ctx, addresses)`, even for empty input.
+    #[allow(clippy::should_implement_trait)] // Submatcher composition, not subtraction.
     pub fn sub<F>(self, func: F) -> BinaryMatcher<'scope>
     where
         F: Fn((&AsyncContext<'_>, Vec<u64>)) -> Result<BinaryMatcher<'scope>>
