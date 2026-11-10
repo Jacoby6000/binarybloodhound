@@ -1,10 +1,10 @@
 use super::*;
+use object::SectionKind;
 use patternsleuth::{
     NamedMemorySection,
     image::Image,
     resolvers::{Context as _, bail_out, eval},
 };
-use object::SectionKind;
 
 #[allow(dead_code)]
 mod two_strings_example {
@@ -54,12 +54,11 @@ where
 #[test]
 fn matchers_compose_directly_with_native_resolver_results() {
     fn build<'scope>() -> patternsleuth::resolvers::Result<Matcher<'scope, (), u64>> {
-        Ok(
-            BinaryMatcher::patterns(["AA DD CC", "AA DD CC"])?
-                .try_map(patternsleuth::resolvers::ensure_one),
-        )
+        Ok(BinaryMatcher::patterns(["AA DD CC", "AA DD CC"])?
+            .try_map(patternsleuth::resolvers::ensure_one))
     }
-    let result: patternsleuth::resolvers::Result<u64> = run_stage(&scan_image(), build().unwrap(), ());
+    let result: patternsleuth::resolvers::Result<u64> =
+        run_stage(&scan_image(), build().unwrap(), ());
     assert_eq!(result.unwrap(), TEXT + 24);
 
     let ambiguous = BinaryMatcher::patterns(["AA BB CC"])
@@ -86,7 +85,10 @@ fn matcher_callbacks_preserve_native_error_variants_without_conversion() {
         .sub(|_| panic!("native error must skip subsequent callbacks"));
     assert_eq!(
         run(&scan_image(), matcher).unwrap_err(),
-        ResolveError::from(patternsleuth::MemoryAccessError::MisalginedAddress(TEXT, TEXT + 8))
+        ResolveError::from(patternsleuth::MemoryAccessError::MisalginedAddress(
+            TEXT,
+            TEXT + 8
+        ))
     );
 }
 
@@ -177,7 +179,7 @@ fn borrowed_stages_compose_with_context_branches_and_sub() {
     let right = stage.last();
     assert_eq!(
         run_stage(&scan_image(), left.union(right), values.as_slice()).unwrap(),
-        [TEXT + 8, TEXT + 8]
+        [TEXT + 8]
     );
 
     let matcher = BinaryMatcher::address(TEXT).sub(|_| {
@@ -307,22 +309,118 @@ fn branch_and_upstream_errors_skip_later_stages() {
 }
 
 #[test]
-fn union_and_intersection_preserve_left_order_and_multiplicity() {
-    let left: Matcher<Vec<u64>, Vec<u64>> = Matcher::identity();
-    let right = Matcher::identity().map(|_: Vec<u64>| vec![3, 2]);
-    assert_eq!(
-        run_stage(
-            &scan_image(),
-            left.clone().union(right.clone()),
-            vec![3, 1, 3, 2]
-        )
-        .unwrap(),
-        [3, 1, 3, 2, 3, 2]
-    );
-    assert_eq!(
-        run_stage(&scan_image(), left.intersection(right), vec![3, 1, 3, 2]).unwrap(),
-        [3, 3, 2]
-    );
+fn union_keeps_first_occurrences_left_then_right() {
+    for (left, right, expected) in [
+        (vec![3, 1, 3, 2], vec![2, 4, 4, 1, 5], vec![3, 1, 2, 4, 5]),
+        (vec![], vec![2, 2, 1], vec![2, 1]),
+        (vec![2, 2, 1], vec![], vec![2, 1]),
+        (vec![], vec![], vec![]),
+    ] {
+        let matcher =
+            Matcher::new::<Vec<u64>>().union(Matcher::from_sync(move |_| Ok(right.clone())));
+        let result = run_stage(&scan_image(), matcher, left).unwrap();
+
+        assert_eq!(result, expected);
+    }
+}
+
+#[test]
+fn union_all_accepts_empty_single_and_multiple_branches() {
+    for (branches, expected) in [
+        (vec![], vec![]),
+        (vec![vec![3, 1, 3]], vec![3, 1]),
+        (
+            vec![vec![3, 1, 3], vec![2, 1], vec![4, 2, 4]],
+            vec![3, 1, 2, 4],
+        ),
+    ] {
+        let matchers = branches
+            .into_iter()
+            .map(|values| Matcher::from_sync(move |()| Ok(values.clone())));
+        let matcher = BinaryMatcher::union_all(matchers);
+        let result = run(&scan_image(), matcher).unwrap();
+
+        assert_eq!(result, expected);
+    }
+}
+
+#[test]
+fn union_all_evaluates_branches_in_order_and_stops_at_the_first_error() {
+    use patternsleuth::MemoryTrait;
+    use std::sync::Mutex;
+
+    let seen = Mutex::new(Vec::new());
+    let first = Matcher::new::<Vec<u64>>()
+        .with_context()
+        .try_map(|(ctx, input)| {
+            seen.lock()
+                .unwrap()
+                .push((input.clone(), ctx.image().memory.u8(TEXT)?));
+            Ok(input)
+        });
+    let second = Matcher::new::<Vec<u64>>()
+        .with_context()
+        .try_map(|(ctx, input)| {
+            seen.lock()
+                .unwrap()
+                .push((input, ctx.image().memory.u8(TEXT)?));
+            Err(ResolveError::new_msg("branch failed"))
+        });
+    let third = Matcher::new::<Vec<u64>>().map(|_| panic!("must stop after error"));
+    let matcher = Matcher::union_all([first, second, third]);
+    let error = run_stage(&scan_image(), matcher, vec![7]).unwrap_err();
+
+    assert_eq!(error.to_string(), "branch failed");
+    assert_eq!(*seen.lock().unwrap(), [(vec![7], 0x90), (vec![7], 0x90)]);
+}
+
+#[test]
+fn intersect_keeps_first_common_occurrences_in_left_order() {
+    for (left, right, expected) in [
+        (vec![3, 1, 3, 2], vec![2, 3, 3, 4], vec![3, 2]),
+        (vec![3, 1], vec![2, 4], vec![]),
+        (vec![], vec![2, 2], vec![]),
+        (vec![2, 2], vec![], vec![]),
+        (vec![], vec![], vec![]),
+    ] {
+        let matcher =
+            Matcher::new::<Vec<u64>>().intersect(Matcher::from_sync(move |_| Ok(right.clone())));
+        let result = run_stage(&scan_image(), matcher, left).unwrap();
+
+        assert_eq!(result, expected);
+    }
+}
+
+#[test]
+fn intersect_all_accepts_empty_single_and_multiple_branches() {
+    for (branches, expected) in [
+        (vec![], vec![]),
+        (vec![vec![3, 1, 3]], vec![3, 1]),
+        (
+            vec![vec![3, 1, 3, 2], vec![2, 3, 1], vec![1, 3, 4]],
+            vec![3, 1],
+        ),
+        (vec![vec![3, 1], vec![], vec![3, 1]], vec![]),
+        (vec![vec![], vec![3, 1]], vec![]),
+    ] {
+        let matchers = branches
+            .into_iter()
+            .map(|values| Matcher::from_sync(move |()| Ok(values.clone())));
+        let result = run(&scan_image(), BinaryMatcher::intersect_all(matchers)).unwrap();
+
+        assert_eq!(result, expected);
+    }
+}
+
+#[test]
+fn intersect_all_propagates_errors_even_after_an_empty_result() {
+    let empty = BinaryMatcher::union_all([]);
+    let failing = Matcher::from_sync(|()| Err(ResolveError::new_msg("branch failed")));
+    let skipped = Matcher::from_sync(|()| panic!("must stop after error"));
+    let matcher = BinaryMatcher::intersect_all([empty, failing, skipped]);
+    let error = run(&scan_image(), matcher).unwrap_err();
+
+    assert_eq!(error.to_string(), "branch failed");
 }
 
 #[test]

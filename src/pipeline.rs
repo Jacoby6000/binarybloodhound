@@ -98,6 +98,47 @@ impl<'scope, I: Clone + Send + 'scope, O: Send + 'scope, T: Send + 'scope> Run<I
     }
 }
 
+enum SetOperation {
+    Union,
+    Intersect,
+}
+
+struct SetAll<'scope, I, T> {
+    matchers: Vec<Matcher<'scope, I, Vec<T>>>,
+    operation: SetOperation,
+}
+
+impl<'scope, I: Clone + Send + 'scope, T: PartialEq + Send + 'scope> Run<I, Vec<T>>
+    for SetAll<'scope, I, T>
+{
+    fn run<'ctx, 'image>(
+        &'ctx self,
+        input: I,
+        ctx: &'ctx AsyncContext<'image>,
+    ) -> BoxFuture<'ctx, Result<Vec<T>>>
+    where
+        I: 'ctx,
+        Vec<T>: 'ctx,
+    {
+        Box::pin(async move {
+            let mut result = Vec::new();
+            for (index, matcher) in self.matchers.iter().enumerate() {
+                let items = matcher.run(input.clone(), ctx).await?;
+                if matches!(self.operation, SetOperation::Intersect) && index > 0 {
+                    result.retain(|item| items.contains(item));
+                } else {
+                    for item in items {
+                        if !result.contains(&item) {
+                            result.push(item);
+                        }
+                    }
+                }
+            }
+            Ok(result)
+        })
+    }
+}
+
 /// A reusable, fallible stage from I to O, with read-only image context.
 /// Cloning shares the stage, not its results; each run evaluates it again.
 /// Inputs, outputs, and transformation captures may borrow for `'scope`.
@@ -364,24 +405,60 @@ impl<'scope, I: Send + 'scope, T: Send + 'scope> Matcher<'scope, I, Vec<T>> {
         self.map(|items| items.into_iter().last().into_iter().collect())
     }
 
-    /// Concatenate both branches, retaining order and duplicates.
+    /// Combine both branches, keeping the first occurrence of each item, left first.
+    /// Both branches run on the same input; the first error stops evaluation.
     pub fn union(self, other: Self) -> Self
-    where
-        I: Clone,
-    {
-        self.fork(other).concat()
-    }
-
-    /// Keep left-branch items present in the right branch, retaining left duplicates.
-    pub fn intersection(self, other: Self) -> Self
     where
         I: Clone,
         T: PartialEq,
     {
-        self.fork(other).map(|(left, right)| {
-            left.into_iter()
-                .filter(|item| right.contains(item))
-                .collect()
+        Self::union_all([self, other])
+    }
+
+    /// Combine branches in iterator order, keeping each item's first occurrence.
+    /// Each branch receives the same input/context. The first error stops evaluation.
+    /// No branches produces an empty result.
+    ///
+    /// ```
+    /// use binary_bloodhound::BinaryMatcher;
+    /// let matcher = BinaryMatcher::union_all([
+    ///     BinaryMatcher::address(0x1000),
+    ///     BinaryMatcher::address(0x2000),
+    ///     BinaryMatcher::address(0x1000),
+    /// ]);
+    /// ```
+    pub fn union_all(matchers: impl IntoIterator<Item = Self>) -> Self
+    where
+        I: Clone,
+        T: PartialEq,
+    {
+        Self::from_run(SetAll {
+            matchers: matchers.into_iter().collect(),
+            operation: SetOperation::Union,
+        })
+    }
+
+    /// Keep the first left-branch occurrence of each item present in the right branch.
+    /// Both branches run on the same input; the first error stops evaluation.
+    pub fn intersect(self, other: Self) -> Self
+    where
+        I: Clone,
+        T: PartialEq,
+    {
+        Self::intersect_all([self, other])
+    }
+
+    /// Intersect branches in iterator order, keeping the first branch's first occurrences.
+    /// Each branch receives the same input/context. The first error stops evaluation.
+    /// No branches produces an empty result.
+    pub fn intersect_all(matchers: impl IntoIterator<Item = Self>) -> Self
+    where
+        I: Clone,
+        T: PartialEq,
+    {
+        Self::from_run(SetAll {
+            matchers: matchers.into_iter().collect(),
+            operation: SetOperation::Intersect,
         })
     }
 }
