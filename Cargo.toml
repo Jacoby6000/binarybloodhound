@@ -1,0 +1,22 @@
+[package]
+name = "binary_bloodhound"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/Jacoby6000/binarybloodhound"
+license = "MIT OR Apache-2.0"
+description = "Composable binary matching and traversal built on patternsleuth"
+
+[dependencies]
+patternsleuth = { git = "https://github.com/Jacoby6000/patternsleuth", branch = "feature/memory-testkit", default-features = false }
+futures = "0.3.30"
+iced-x86 = "1.20.0"
+
+[dev-dependencies]
+anyhow = "1.0.79"
+object = "0.32.2"
+
+[features]
+default = ["image-pe", "image-elf"]
+image-pe = ["patternsleuth/image-pe"]
+image-elf = ["patternsleuth/image-elf"]
+symbols = ["patternsleuth/symbols"]
