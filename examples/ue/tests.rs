@@ -377,6 +377,87 @@ fn gengine_pipeline_matches_upstream_register_tracking() {
     assert_eq!(result.0, 0x4000);
 }
 
+#[cfg(feature = "image-pe")]
+fn gengine_branch_image(destination: u64) -> Image<'static> {
+    let mut bytes = vec![0x90; 256];
+    relative(&mut bytes, 0, &[0x48, 0x8d, 0x0d], 0x4000);
+    relative(&mut bytes, 7, &[0x0f, 0x84], 0x1000 + 20);
+    relative(&mut bytes, 13, &[0xe9], 0x1000 + destination);
+    relative(&mut bytes, 20, &[0x48, 0x8d, 0x0d], 0x5000);
+    relative(&mut bytes, 27, &[0xe9], 0x1000 + 40);
+    relative(&mut bytes, 40, &[0x4c, 0x8d, 0x05], 0x1100);
+    relative(&mut bytes, 48, &[0xe9], 0xffff);
+    bytes.extend(util::utf16("rhi.DumpMemory\0"));
+    pe_image(bytes)
+}
+
+#[test]
+#[cfg(feature = "image-pe")]
+fn gengine_walker_returns_rcx_before_other_paths_can_overwrite_it() {
+    let image = gengine_branch_image(40);
+    let result = image.resolve(models::engine::GEngine::resolver()).unwrap();
+    let upstream = image
+        .resolve(patternsleuth::resolvers::unreal::gengine::GEngine::resolver())
+        .unwrap();
+
+    // Upstream shares RCX across paths; the fold returns the reaching path's value.
+    assert_eq!(result.0, 0x4000);
+    assert_eq!(upstream.0, 0x5000);
+}
+
+#[test]
+#[cfg(feature = "image-pe")]
+fn gengine_walker_resumes_queued_paths_after_a_range_stop() {
+    let image = gengine_branch_image(48);
+    let result = image.resolve(models::engine::GEngine::resolver()).unwrap();
+    let upstream = image
+        .resolve(patternsleuth::resolvers::unreal::gengine::GEngine::resolver())
+        .unwrap();
+
+    assert_eq!(result.0, upstream.0);
+    assert_eq!(result.0, 0x5000);
+}
+
+#[test]
+#[cfg(feature = "image-pe")]
+fn gengine_walker_does_not_borrow_rcx_from_a_different_path() {
+    let mut bytes = vec![0x90; 256];
+    relative(&mut bytes, 0, &[0x0f, 0x84], 0x1000 + 24);
+    relative(&mut bytes, 6, &[0x48, 0x8d, 0x0d], 0x4000);
+    relative(&mut bytes, 13, &[0xe9], 0x1000 + 48);
+    relative(&mut bytes, 24, &[0x4c, 0x8d, 0x05], 0x1100);
+    bytes[48] = 0xc3;
+    bytes.extend(util::utf16("rhi.DumpMemory\0"));
+    let image = pe_image(bytes);
+    let result = image.resolve(models::engine::GEngine::resolver());
+    let upstream = image
+        .resolve(patternsleuth::resolvers::unreal::gengine::GEngine::resolver())
+        .unwrap();
+
+    assert!(result.is_err());
+    assert_eq!(upstream.0, 0x4000);
+}
+
+#[test]
+#[cfg(feature = "image-pe")]
+fn gengine_pipeline_requires_r8_at_the_original_reference() {
+    let mut bytes = vec![0x90; 256];
+    relative(&mut bytes, 0, &[0x48, 0x8d, 0x0d], 0x4000);
+    relative(&mut bytes, 7, &[0x4c, 0x8d, 0x05], 0x5000);
+    relative(&mut bytes, 14, &[0x48, 0x8d, 0x0d], 0x1100);
+    bytes[21] = 0xc3;
+    bytes.extend(util::utf16("rhi.DumpMemory\0"));
+    let image = pe_image(bytes);
+    let error = image
+        .resolve(models::engine::GEngine::resolver())
+        .unwrap_err();
+    let upstream = image
+        .resolve(patternsleuth::resolvers::unreal::gengine::GEngine::resolver())
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), upstream.to_string());
+}
+
 #[test]
 #[cfg(feature = "image-pe")]
 fn fname_constructor_keeps_direct_prologue_priority() {

@@ -6,38 +6,34 @@ pub use super::models::engine::GEngine;
 impl_resolver_singleton!(collect, GEngine);
 impl_resolver_singleton!(PEImage, GEngine, |ctx| async {
     use super::util;
-    use binary_bloodhound::BinaryMatcher;
+    use binary_bloodhound::{BinaryMatcher, Control};
     use iced_x86::Register;
-    use patternsleuth::disassemble::{Control, disassemble};
 
     BinaryMatcher::pattern(util::utf16_pattern("rhi.DumpMemory\0"))
         .references()
-        .flat_map(|reference| {
-            BinaryMatcher::candidates([reference.0])
-                .root_functions()
-                .with_context()
-                .filter_modify(move |(ctx, function)| {
-                    let mut is_match = false;
-                    let mut rcx = None;
+        .walk_disassembly(
+            |reference| (reference.0, None, None),
+            |(reference_addr, start, rcx), inst| {
+                let ip = inst.ip();
+                let op0_reg = inst.op0_register();
+                let start = start.unwrap_or(ip);
 
-                    disassemble(ctx.image(), function.start, |inst| {
-                        let cur = inst.ip();
-                        if !(function.start..=reference.0).contains(&cur) {
-                            return Ok(Control::Break);
-                        }
-                        if reference.0 == cur && inst.op0_register() == Register::R8 {
-                            is_match = true;
-                            return Ok(Control::Break);
-                        }
-                        if inst.op0_register() == Register::RCX && inst.is_ip_rel_memory_operand() {
-                            rcx = Some(inst.ip_rel_memory_address());
-                        }
-                        Ok(Control::Continue)
-                    })?;
-
-                    Ok(is_match.then_some(rcx).flatten())
-                })
-        })
+                if !(start..=reference_addr).contains(&ip) {
+                    return Ok(Control::Break);
+                }
+                if ip == reference_addr && op0_reg == Register::R8 {
+                    return Ok(rcx.map_or(Control::Break, Control::Return));
+                }
+                match (op0_reg, inst.is_ip_rel_memory_operand()) {
+                    (Register::RCX, true) => Ok(Control::Continue((
+                        reference_addr,
+                        Some(start),
+                        Some(inst.ip_rel_memory_address()),
+                    ))),
+                    _ => Ok(Control::Continue((reference_addr, Some(start), rcx))),
+                }
+            },
+        )
         .ensure_one()
         .map(Self)
         .resolve(ctx)

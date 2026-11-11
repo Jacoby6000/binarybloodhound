@@ -364,6 +364,26 @@ impl<'scope, I: Send + 'scope, O: Send + 'scope, C: Cardinality> Matcher<'scope,
         self.try_map(move |item| Ok(func(item)))
     }
 
+    /// Map each candidate to an optional value, discarding None results.
+    /// Preserve order and duplicates; filtering returns Variable cardinality.
+    pub fn map_filter<T, F>(self, func: F) -> Matcher<'scope, I, T>
+    where
+        T: Send + 'scope,
+        F: Fn(O) -> Option<T> + Send + Sync + 'scope,
+    {
+        self.try_map_filter(move |item| Ok(func(item)))
+    }
+
+    /// Fallible map_filter; stop at the first callback error.
+    pub fn try_map_filter<T, F>(self, func: F) -> Matcher<'scope, I, T>
+    where
+        T: Send + 'scope,
+        F: Fn(O) -> Result<Option<T>> + Send + Sync + 'scope,
+    {
+        self.with_context()
+            .try_map_filter(move |(_, item)| func(item))
+    }
+
     /// Fallibly transform candidates, stopping at the first error.
     pub fn try_map<T, F>(self, func: F) -> Matcher<'scope, I, T, C>
     where

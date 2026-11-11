@@ -221,12 +221,30 @@ impl<'scope, I: Send + 'scope, O: Send + 'scope, C: Cardinality> WithContext<'sc
         self.filter_modify(move |(ctx, item)| Ok(predicate((ctx, &item))?.then_some(item)))
     }
 
-    pub fn filter_modify<U, F>(self, func: F) -> Matcher<'scope, I, U>
+    /// Map candidates to optional values with context, discarding None results.
+    pub fn map_filter<U, F>(self, func: F) -> Matcher<'scope, I, U>
+    where
+        U: Send + 'scope,
+        F: Fn((MatchContext<'_, '_>, O)) -> Option<U> + Send + Sync + 'scope,
+    {
+        self.try_map_filter(move |input| Ok(func(input)))
+    }
+
+    /// Fallible map_filter; stop at the first callback error.
+    pub fn try_map_filter<U, F>(self, func: F) -> Matcher<'scope, I, U>
     where
         U: Send + 'scope,
         F: Fn((MatchContext<'_, '_>, O)) -> Result<Option<U>> + Send + Sync + 'scope,
     {
         self.try_expand(move |input| Ok(func(input)?.into_iter().collect()))
+    }
+
+    pub fn filter_modify<U, F>(self, func: F) -> Matcher<'scope, I, U>
+    where
+        U: Send + 'scope,
+        F: Fn((MatchContext<'_, '_>, O)) -> Result<Option<U>> + Send + Sync + 'scope,
+    {
+        self.try_map_filter(func)
     }
 }
 

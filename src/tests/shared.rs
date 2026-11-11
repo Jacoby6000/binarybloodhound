@@ -1,4 +1,5 @@
 use super::*;
+include!("walk_disassembly.rs");
 use object::SectionKind;
 use patternsleuth::{
     NamedMemorySection,
@@ -1845,6 +1846,252 @@ fn root_functions_skip_addresses_outside_the_function_table() {
     let result = run(&scan_image(), matcher).unwrap();
 
     assert_eq!(result, [TEXT, TEXT + 64]);
+}
+
+#[test]
+fn disassemble_matches_upstream_branch_order_without_following_calls() {
+    use patternsleuth::disassemble::{Control, disassemble};
+
+    let mut text = vec![0x90; 256];
+    relative(&mut text, 0, &[0x0f, 0x84], TEXT + 32);
+    relative(&mut text, 6, &[0x0f, 0x84], TEXT + 40);
+    relative(&mut text, 12, &[0xe8], TARGET);
+    relative(&mut text, 17, &[0xe9], TEXT + 24);
+    text[24] = 0xc3;
+    text[32] = 0xc3;
+    text[40] = 0xc3;
+    let image = image(text);
+    let mut upstream = Vec::new();
+    disassemble(&image, TEXT, |instruction| {
+        upstream.push(*instruction);
+        Ok(Control::Continue)
+    })
+    .unwrap();
+    let matcher = BinaryMatcher::address(TEXT)
+        .root_functions()
+        .ensure_one()
+        .disassemble();
+    let result = run_stage(&image, matcher, ()).unwrap();
+
+    assert_eq!(result, upstream);
+    assert_eq!(
+        result
+            .iter()
+            .map(|instruction| instruction.ip())
+            .collect::<Vec<_>>(),
+        [
+            TEXT,
+            TEXT + 6,
+            TEXT + 12,
+            TEXT + 17,
+            TEXT + 24,
+            TEXT + 40,
+            TEXT + 32
+        ]
+    );
+}
+
+#[test]
+fn disassemble_until_stops_one_path_but_visits_queued_branches() {
+    use patternsleuth::disassemble::{Control, disassemble};
+
+    let mut text = vec![0x90; 256];
+    relative(&mut text, 0, &[0x0f, 0x84], TEXT + 16);
+    text[16] = 0xc3;
+    let matcher = BinaryMatcher::address(TEXT)
+        .root_functions()
+        .ensure_one()
+        .disassemble_until(|instruction| instruction.ip() == TEXT + 6);
+    let image = image(text);
+    let result = run_stage(&image, matcher, ()).unwrap();
+    let mut upstream = Vec::new();
+    disassemble(&image, TEXT, |instruction| {
+        upstream.push(*instruction);
+        Ok(if instruction.ip() == TEXT + 6 {
+            Control::Break
+        } else {
+            Control::Continue
+        })
+    })
+    .unwrap();
+
+    assert_eq!(result, upstream);
+    assert_eq!(
+        result
+            .iter()
+            .map(|instruction| instruction.ip())
+            .collect::<Vec<_>>(),
+        [TEXT, TEXT + 6, TEXT + 16]
+    );
+}
+
+#[test]
+fn disassemble_until_does_not_follow_the_stopped_branch() {
+    let mut text = vec![0x90; 256];
+    relative(&mut text, 0, &[0xe9], TEXT + 16);
+    text[16] = 0x0f;
+    text[17] = 0xff;
+    let matcher = BinaryMatcher::address(TEXT)
+        .root_functions()
+        .ensure_one()
+        .disassemble_until(|_| true);
+    let result = run_stage(&image(text), matcher, ()).unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].ip(), TEXT);
+}
+
+#[test]
+fn disassemble_skips_empty_candidate_collections() {
+    let matcher = functions(&[]).disassemble_until(|_| panic!("no function to disassemble"));
+    let result = run_stage(&image(vec![]), matcher, ()).unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[test]
+fn disassemble_preserves_candidate_order_duplicates_and_cardinality() {
+    let mut text = vec![0x90; 256];
+    text[0] = 0xc3;
+    text[64] = 0xc3;
+    let matcher: Matcher<(), Vec<iced_x86::Instruction>> =
+        BinaryMatcher::candidates([TEXT + 64, TEXT, TEXT + 64])
+            .root_functions()
+            .disassemble();
+    let result = run_stage(&image(text), matcher, ()).unwrap();
+
+    assert_eq!(
+        result
+            .into_iter()
+            .map(|instructions| instructions[0].ip())
+            .collect::<Vec<_>>(),
+        [TEXT + 64, TEXT, TEXT + 64]
+    );
+}
+
+#[test]
+fn disassemble_skips_out_of_function_branches_and_terminates_cycles() {
+    let mut text = vec![0x90; 256];
+    relative(&mut text, 0, &[0x0f, 0x84], TARGET);
+    relative(&mut text, 6, &[0xe9], TEXT);
+    let matcher = BinaryMatcher::address(TEXT)
+        .root_functions()
+        .ensure_one()
+        .disassemble();
+    let result = run_stage(&image(text), matcher, ()).unwrap();
+
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+fn disassemble_intersects_function_and_search_bounds() {
+    let matcher = functions(&[(TEXT + 8, TEXT + 10)]).sub(
+        BinaryMatcher::address(TEXT)
+            .root_functions()
+            .ensure_one()
+            .disassemble(),
+    );
+    let result = run_stage(&image(vec![0x90; 256]), matcher, ()).unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result[0]
+            .iter()
+            .map(|instruction| instruction.ip())
+            .collect::<Vec<_>>(),
+        [TEXT + 8, TEXT + 9]
+    );
+}
+
+#[test]
+fn disassemble_retains_empty_vectors_for_empty_and_disjoint_ranges() {
+    let empty = functions(&[(TEXT, TEXT)]).disassemble();
+    let disjoint =
+        functions(&[(TEXT + 64, TEXT + 80)]).sub(functions(&[(TEXT, TEXT + 32)]).disassemble());
+    let image = image(vec![]);
+
+    assert!(run_stage(&image, empty, ()).unwrap()[0].is_empty());
+    assert!(run_stage(&image, disjoint, ()).unwrap()[0].is_empty());
+}
+
+#[test]
+fn disassemble_propagates_memory_decode_and_invalid_range_errors() {
+    let missing = functions(&[(TEXT, TEXT + 64)]).disassemble();
+    let error = run_stage(&image(vec![]).without_section(".text"), missing, ()).unwrap_err();
+
+    assert_eq!(
+        error,
+        ResolveError::from(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError)
+    );
+
+    let truncated = functions(&[(TEXT, TEXT + 1)]).disassemble();
+    let error = run_stage(&image(vec![0x0f, 0x84, 0, 0, 0, 0]), truncated, ()).unwrap_err();
+
+    assert!(error.to_string().contains("invalid instruction"));
+
+    let invalid = functions(&[(TEXT + 1, TEXT)]).disassemble();
+    let error = run_stage(&image(vec![]), invalid, ()).unwrap_err();
+
+    assert!(error.to_string().contains("invalid function range"));
+}
+
+#[test]
+fn disassemble_reusable_stage_collects_one_vector_per_function() {
+    let matcher = functions(&[(TEXT, TEXT + 1)]).then(stages::disassemble());
+    let result = run_stage(&image(vec![0xc3]), matcher, ()).unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0][0].ip(), TEXT);
+}
+
+#[test]
+fn map_filter_preserves_order_and_duplicates_but_returns_variable() {
+    let matcher: Matcher<Vec<u64>, u64> =
+        Matcher::items::<u64>().map_filter(|value| (value > 1).then_some(value * 2));
+    let exact: Matcher<(), u64> = BinaryMatcher::address(1).ensure_one().map_filter(|_| None);
+
+    assert_eq!(
+        run_stage(&scan_image(), matcher, vec![3, 1, 3, 2]).unwrap(),
+        [6, 6, 4]
+    );
+    assert!(run_stage(&scan_image(), exact, ()).unwrap().is_empty());
+}
+
+#[test]
+fn map_filter_skips_empty_input_and_supports_non_clone_values() {
+    let empty = Matcher::items::<u64>()
+        .map_filter(|_| -> Option<u64> { panic!("empty candidates must skip callbacks") });
+    let matcher =
+        Matcher::items::<String>().map_filter(|value| (!value.is_empty()).then_some(value));
+
+    assert!(run_stage(&scan_image(), empty, vec![]).unwrap().is_empty());
+    assert_eq!(
+        run_stage(&scan_image(), matcher, vec!["value".into(), String::new()]).unwrap(),
+        ["value"]
+    );
+}
+
+#[test]
+fn try_map_filter_stops_at_the_first_error() {
+    let matcher = Matcher::items::<u64>().try_map_filter(|value| match value {
+        1 => Ok(Some(value)),
+        2 => Err(ResolveError::new_msg("filter failed")),
+        _ => panic!("error must skip later candidates"),
+    });
+    let error = run_stage(&scan_image(), matcher, vec![1, 2, 3]).unwrap_err();
+
+    assert_eq!(error.to_string(), "filter failed");
+}
+
+#[test]
+fn context_map_filter_returns_to_data_only_callbacks() {
+    let matcher = BinaryMatcher::address(3)
+        .with_context()
+        .map_filter(|(ctx, value)| Some(ctx.image().base_address + value))
+        .map(|value| value + 1);
+    let result = run_stage(&scan_image(), matcher, ()).unwrap();
+
+    assert_eq!(result, [BASE + 4]);
 }
 
 #[test]

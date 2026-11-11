@@ -11,7 +11,9 @@ pub use context::WithContext;
 mod evaluation;
 pub use evaluation::MatchContext;
 mod cardinality;
+mod disassembly;
 pub use cardinality::{Cardinality, ExactlyOne, Variable};
+pub use disassembly::Control;
 
 #[cfg(test)]
 mod tests;
@@ -200,6 +202,41 @@ impl<'scope> BinaryMatcher<'scope> {
 }
 
 impl<'scope, I: Send + 'scope, C: Cardinality> Matcher<'scope, I, FunctionEntry, C> {
+    /// Collect reachable instructions into one vector per function, retaining cardinality.
+    /// Visit fallthrough before queued branches (LIFO), without following calls.
+    /// Function ranges intersect search bounds; out-of-range branches are skipped.
+    /// Empty ranges produce empty vectors. Memory and invalid-instruction errors propagate.
+    ///
+    /// ```
+    /// use binary_bloodhound::BinaryMatcher;
+    /// let matcher = BinaryMatcher::address(0x1000)
+    ///     .root_functions()
+    ///     .disassemble()
+    ///     .map_filter(|instructions| {
+    ///         instructions.into_iter().find(|instruction| instruction.is_call_near())
+    ///     });
+    /// ```
+    ///
+    /// Function metadata is required; raw addresses do not define decoding bounds:
+    /// ```compile_fail
+    /// use binary_bloodhound::BinaryMatcher;
+    /// let invalid = BinaryMatcher::address(0x1000).disassemble();
+    /// ```
+    pub fn disassemble(self) -> Matcher<'scope, I, Vec<iced_x86::Instruction>, C> {
+        self.disassemble_until(|_| false)
+    }
+
+    /// Like disassemble, but stop the current path after including an instruction
+    /// matching the predicate. Previously queued branches still run.
+    /// The stopped instruction's branch target is not followed or queued.
+    pub fn disassemble_until<F>(self, stop: F) -> Matcher<'scope, I, Vec<iced_x86::Instruction>, C>
+    where
+        F: Fn(&iced_x86::Instruction) -> bool + Send + Sync + 'scope,
+    {
+        self.with_context()
+            .try_map(move |(ctx, function)| disassembly::collect(ctx, function, &stop))
+    }
+
     /// Run an inner matcher within each function's half-open range, in input order.
     /// Concatenate results without deduplication. Nested scopes intersect their bounds;
     /// empty scopes are skipped, invalid ranges and inner errors stop evaluation.
@@ -235,6 +272,45 @@ impl<'scope, I: Send + 'scope, C: Cardinality> Matcher<'scope, I, FunctionEntry,
 impl<'scope, I: Send + 'scope, T: HasAddress + Send + 'scope, C: Cardinality>
     Matcher<'scope, I, T, C>
 {
+    /// Fold instructions from each candidate's containing root using upstream traversal.
+    /// Resolve function metadata from the image; skip unknown roots without initializing.
+    /// Initialize state from the original candidate, not the resolved function metadata.
+    /// Clone state at queued branches; only Control::Return emits a candidate.
+    /// Path exhaustion discards state; Exit ends this candidate's walk, not later ones.
+    /// Upstream deduplicates instruction addresses globally within each walk, even
+    /// when converging branches carry different state.
+    ///
+    /// Follow can leave the recorded function range. Active search bounds filter
+    /// visited instructions, but upstream may read a target before visiting it.
+    /// Metadata, visitor, memory and invalid-instruction errors stop later candidates.
+    ///
+    /// ```
+    /// use binary_bloodhound::{BinaryMatcher, Control};
+    /// use iced_x86::FlowControl;
+    /// let matcher = BinaryMatcher::address(0x1008)
+    ///     .walk_disassembly(|address| (address, 0_usize), |(address, count), instruction| {
+    ///         Ok(if instruction.flow_control() == FlowControl::Return {
+    ///             Control::Return((address, count))
+    ///         } else {
+    ///             Control::Continue((address, count + 1))
+    ///         })
+    ///     });
+    /// ```
+    pub fn walk_disassembly<S, R, Init, F>(self, initial: Init, visitor: F) -> Matcher<'scope, I, R>
+    where
+        S: Clone + Send + 'scope,
+        R: Send + 'scope,
+        Init: Fn(T) -> S + Send + Sync + 'scope,
+        F: Fn(S, &iced_x86::Instruction) -> Result<Control<S, R>> + Send + Sync + 'scope,
+    {
+        self.with_context().try_expand(move |(ctx, candidate)| {
+            let Some(function) = root_entry(ctx.image(), candidate.address())? else {
+                return Ok(Vec::new());
+            };
+            disassembly::walk(ctx, function, initial(candidate), &visitor)
+        })
+    }
+
     /// Extract raw addresses, preserving order and duplicates.
     pub fn addresses(self) -> Matcher<'scope, I, u64, C> {
         self.map(|node| node.address())
@@ -303,22 +379,8 @@ impl<'scope, I: Send + 'scope, T: HasAddress + Send + 'scope, C: Cardinality>
 
     /// Map to root-function metadata; skip unknown functions and propagate errors.
     pub fn root_functions(self) -> Matcher<'scope, I, FunctionEntry> {
-        self.with_context().filter_modify(|(ctx, node)| {
-            let Some(function) = root_function(ctx.image(), node.address())? else {
-                return Ok(None);
-            };
-            if function.range.end < function.range.start {
-                return Err(ResolveError::new_msg(format!(
-                    "invalid function range: {:#x}..{:#x}",
-                    function.range.start, function.range.end
-                )));
-            }
-            Ok(Some(FunctionEntry {
-                start: function.range.start,
-                end: function.range.end,
-                unwind: (function.unwind != 0).then_some(function.unwind),
-            }))
-        })
+        self.with_context()
+            .filter_modify(|(ctx, node)| root_entry(ctx.image(), node.address()))
     }
 
     /// Inspect outgoing calls once, retaining both instruction sites and targets.
@@ -368,6 +430,27 @@ impl<'scope, I: Send + 'scope, C: Cardinality> Matcher<'scope, I, u64, C> {
 /// Typed stages for composing address, instruction, function, and call results.
 pub mod stages {
     use super::*;
+
+    /// Collect one instruction vector per function using the current search bounds.
+    pub fn disassemble<'scope>() -> Matcher<'scope, Vec<FunctionEntry>, Vec<iced_x86::Instruction>>
+    {
+        Matcher::items::<FunctionEntry>().disassemble()
+    }
+
+    /// Fold each address-bearing candidate's root, initializing from the original candidate.
+    pub fn walk_disassembly<'scope, T, S, R, Init, F>(
+        initial: Init,
+        visitor: F,
+    ) -> Matcher<'scope, Vec<T>, R>
+    where
+        T: HasAddress + Send + 'scope,
+        S: Clone + Send + 'scope,
+        R: Send + 'scope,
+        Init: Fn(T) -> S + Send + Sync + 'scope,
+        F: Fn(S, &iced_x86::Instruction) -> Result<Control<S, R>> + Send + Sync + 'scope,
+    {
+        Matcher::items::<T>().walk_disassembly(initial, visitor)
+    }
 
     /// Resolve signed 4-byte displacements relative to the end of each displacement.
     pub fn rip4<'scope, T: HasAddress + Send + 'scope>() -> Matcher<'scope, Vec<T>, u64> {
@@ -437,6 +520,26 @@ pub mod stages {
     pub fn calls<'scope, T: HasAddress + Send + 'scope>() -> Matcher<'scope, Vec<T>, Call> {
         Matcher::items::<T>().calls()
     }
+}
+
+fn root_entry(
+    image: &patternsleuth::image::Image<'_>,
+    address: u64,
+) -> Result<Option<FunctionEntry>> {
+    let Some(function) = root_function(image, address)? else {
+        return Ok(None);
+    };
+    if function.range.end < function.range.start {
+        return Err(ResolveError::new_msg(format!(
+            "invalid function range: {:#x}..{:#x}",
+            function.range.start, function.range.end
+        )));
+    }
+    Ok(Some(FunctionEntry {
+        start: function.range.start,
+        end: function.range.end,
+        unwind: (function.unwind != 0).then_some(function.unwind),
+    }))
 }
 
 fn root_function(
