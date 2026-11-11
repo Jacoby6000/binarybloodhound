@@ -19,12 +19,12 @@ fn image(text: Vec<u8>) -> Image<'static> {
     construct_image(text, 2)
 }
 
-fn run<T: HasAddress + Send>(
+fn run<T: HasAddress + Send, C: Cardinality>(
     image: &Image<'_>,
-    matcher: Matcher<'_, (), Vec<T>>,
+    matcher: Matcher<'_, (), T, C>,
 ) -> Result<Vec<u64>> {
     eval(image, move |ctx| {
-        Box::pin(async move { matcher.addresses().resolve(ctx).await })
+        Box::pin(async move { matcher.into_variable().addresses().resolve(ctx).await })
     })
 }
 
@@ -32,10 +32,15 @@ fn patterns<'scope>(values: &[&str]) -> BinaryMatcher<'scope> {
     BinaryMatcher::patterns(values).unwrap()
 }
 
-fn run_stage<I, O>(image: &Image<'_>, matcher: Matcher<I, O>, input: I) -> Result<O>
+fn run_stage<'scope, I, O, C: Cardinality>(
+    image: &Image<'_>,
+    matcher: Matcher<'scope, I, O, C>,
+    input: I,
+) -> Result<C::Output<O>>
 where
     I: Send + Sync,
     O: Send + Sync,
+    C::Output<O>: Sync,
 {
     eval(image, move |ctx| {
         Box::pin(async move { matcher.run(input, ctx).await })
@@ -43,18 +48,133 @@ where
 }
 
 #[test]
+fn address_reads_rip4_preserves_order_duplicates_and_signed_offsets() {
+    let bytes = [16_i32, -8, 0]
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect();
+    let image = image(bytes);
+    let matcher = Matcher::from_sync(|()| {
+        Ok(vec![
+            InstructionSite(TEXT + 4),
+            InstructionSite(TEXT),
+            InstructionSite(TEXT + 8),
+            InstructionSite(TEXT + 4),
+        ])
+    })
+    .rip4();
+
+    assert_eq!(
+        run(&image, matcher).unwrap(),
+        [TEXT, TEXT + 20, TEXT + 12, TEXT]
+    );
+}
+
+#[test]
+fn address_reads_u64_preserves_order_duplicates_and_full_width() {
+    let values = [0xfedc_ba98_7654_3210_u64, 0x0123_4567_89ab_cdef];
+    let mut bytes = vec![0xff];
+    bytes.extend(values.into_iter().flat_map(u64::to_le_bytes));
+    let image = image(bytes);
+    let matcher = Matcher::from_sync(|()| {
+        Ok(vec![
+            Address(TEXT + 9),
+            Address(TEXT + 1),
+            Address(TEXT + 9),
+        ])
+    })
+    .read_u64();
+
+    assert_eq!(
+        run(&image, matcher).unwrap(),
+        [values[1], values[0], values[1]]
+    );
+}
+
+#[test]
+fn address_reads_deref_chains_without_validating_the_final_destination() {
+    let image = image(
+        [TEXT + 8, TARGET]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect(),
+    );
+    let matcher = BinaryMatcher::address(TEXT).deref().deref();
+
+    assert_eq!(run(&image, matcher).unwrap(), [TARGET]);
+}
+
+#[test]
+fn address_reads_propagate_truncated_and_unmapped_memory_errors() {
+    let image = image(vec![0; 8]);
+    let operations: [for<'a> fn(BinaryMatcher<'a>) -> BinaryMatcher<'a>; 3] = [
+        |matcher| matcher.rip4(),
+        |matcher| matcher.read_u64(),
+        |matcher| matcher.deref(),
+    ];
+    for operation in operations {
+        for address in [TEXT + 7, TEXT + 16] {
+            let result = run(&image, operation(BinaryMatcher::address(address)));
+
+            assert_eq!(
+                result.unwrap_err(),
+                ResolveError::from(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError)
+            );
+        }
+    }
+}
+
+#[test]
+fn address_reads_reject_read_range_overflow_before_accessing_memory() {
+    let image = image(vec![]);
+    let operations: [for<'a> fn(BinaryMatcher<'a>) -> BinaryMatcher<'a>; 3] = [
+        |matcher| matcher.rip4(),
+        |matcher| matcher.read_u64(),
+        |matcher| matcher.deref(),
+    ];
+    for operation in operations {
+        let error = run(&image, operation(BinaryMatcher::address(u64::MAX))).unwrap_err();
+
+        assert!(error.to_string().contains("overflow"));
+    }
+}
+
+#[test]
+fn address_reads_rip4_rejects_target_overflow_and_underflow() {
+    for (address, displacement) in [(0, -8_i32), (u64::MAX - 8, 8)] {
+        let image = image(vec![]).with_section(section(
+            ".relative",
+            address,
+            SectionKind::Data,
+            displacement.to_le_bytes().to_vec(),
+        ));
+        let error = run(&image, BinaryMatcher::address(address).rip4()).unwrap_err();
+
+        assert!(error.to_string().contains("target overflow"));
+    }
+}
+
+#[test]
+fn address_reads_accept_empty_input() {
+    let matcher = Matcher::from_sync(|()| Ok(Vec::<u64>::new()))
+        .rip4()
+        .read_u64()
+        .deref();
+    let result = run(&image(vec![]), matcher).unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[test]
 fn matchers_compose_directly_with_native_resolver_results() {
-    fn build<'scope>() -> patternsleuth::resolvers::Result<Matcher<'scope, (), u64>> {
-        Ok(BinaryMatcher::patterns(["AA DD CC", "AA DD CC"])?
-            .try_map(patternsleuth::resolvers::ensure_one))
+    fn build<'scope>() -> patternsleuth::resolvers::Result<Matcher<'scope, (), u64, ExactlyOne>> {
+        Ok(BinaryMatcher::patterns(["AA DD CC", "AA DD CC"])?.ensure_one())
     }
     let result: patternsleuth::resolvers::Result<u64> =
         run_stage(&scan_image(), build().unwrap(), ());
     assert_eq!(result.unwrap(), TEXT + 24);
 
-    let ambiguous = BinaryMatcher::patterns(["AA BB CC"])
-        .unwrap()
-        .try_map(patternsleuth::resolvers::ensure_one);
+    let ambiguous = BinaryMatcher::patterns(["AA BB CC"]).unwrap().ensure_one();
     assert_eq!(
         run_stage(&scan_image(), ambiguous, ()).unwrap_err(),
         patternsleuth::resolvers::ensure_one([TEXT + 8, TARGET]).unwrap_err()
@@ -68,12 +188,12 @@ fn matcher_callbacks_preserve_native_error_variants_without_conversion() {
     }
 
     let matcher = BinaryMatcher::address(TEXT)
-        .try_map(reject)
+        .try_transform_all(reject)
         .first()
         .xrefs()
         .addresses()
         .with_context()
-        .sub(|_| panic!("native error must skip subsequent callbacks"));
+        .transform_all(|_| -> Vec<u64> { panic!("native error must skip subsequent callbacks") });
     assert_eq!(
         run(&scan_image(), matcher).unwrap_err(),
         ResolveError::from(patternsleuth::MemoryAccessError::MisalginedAddress(
@@ -90,8 +210,8 @@ fn new_passes_non_clone_input_and_infers_transformed_output() {
     }
 
     let stage = Matcher::new::<Input>()
-        .map(|input| input.addresses)
-        .map(|addresses| addresses.len());
+        .transform(|input| input.addresses)
+        .transform(|addresses| addresses.len());
     assert_eq!(
         run_stage(
             &scan_image(),
@@ -110,7 +230,7 @@ fn from_sync_infers_types_and_accepts_borrowed_inputs_outputs_and_captures() {
     let text = String::from("prefix:payload");
     let prefix = String::from("prefix:");
     let stage =
-        Matcher::from_sync(|value: &str| Ok(value.strip_prefix(prefix.as_str()).unwrap_or(value)));
+        Matcher::from_value(|value: &str| Ok(value.strip_prefix(prefix.as_str()).unwrap_or(value)));
     assert_eq!(
         run_stage(&scan_image(), stage, text.as_str()).unwrap(),
         "payload"
@@ -124,7 +244,7 @@ fn from_sync_preserves_native_errors_and_skips_subsequent_stages() {
     });
     let matcher = BinaryMatcher::address(TEXT)
         .then(stage)
-        .map(|_| panic!("callback must not run after an error"));
+        .transform(|_| panic!("callback must not run after an error"));
     assert_eq!(
         run_stage(&scan_image(), matcher, ()).unwrap_err(),
         ResolveError::from(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError)
@@ -135,7 +255,8 @@ fn from_sync_preserves_native_errors_and_skips_subsequent_stages() {
 fn stages_accept_borrowed_inputs_outputs_and_captures() {
     let text = String::from("prefix:payload");
     let prefix = String::from("prefix:");
-    let stage = Matcher::new::<&str>().map(|value| value.strip_prefix(prefix.as_str()).unwrap());
+    let stage =
+        Matcher::new::<&str>().transform(|value| value.strip_prefix(prefix.as_str()).unwrap());
     let result = run_stage(&scan_image(), stage, text.as_str()).unwrap();
     assert_eq!(result, "payload");
     assert_eq!(result.as_ptr(), text[prefix.len()..].as_ptr());
@@ -146,7 +267,7 @@ fn borrowed_outputs_survive_a_shorter_evaluation_context() {
     let text = String::from("borrowed result");
     let result = {
         let image = scan_image();
-        let matcher = BinaryMatcher::address(TEXT).map(|_| text.as_str());
+        let matcher = BinaryMatcher::address(TEXT).transform(|_| text.as_str());
         eval(&image, move |ctx| {
             Box::pin(async move { matcher.resolve(ctx).await })
         })
@@ -160,17 +281,17 @@ fn from_async_can_read_image_memory() {
     use patternsleuth::MemoryTrait;
 
     let matcher = Matcher::from_async(|address, ctx| {
-        Box::pin(async move { Ok(ctx.image().memory.u8(address)?) })
+        Box::pin(async move { Ok(vec![ctx.image().memory.u8(address)?]) })
     });
     let result = run_stage(&scan_image(), matcher, TEXT + 8).unwrap();
 
-    assert_eq!(result, 0xaa);
+    assert_eq!(result, [0xaa]);
 }
 
 #[test]
 fn fork_passes_the_same_input_to_both_branches() {
-    let left = Matcher::new::<u64>().map(|value| value + 1);
-    let right = Matcher::new::<u64>().map(|value| value * 2);
+    let left = Matcher::new::<u64>().transform(|value| value + 1);
+    let right = Matcher::new::<u64>().transform(|value| value * 2);
     let result = run_stage(&scan_image(), left.fork(right), 3).unwrap();
 
     assert_eq!(result, (4, 6));
@@ -178,10 +299,10 @@ fn fork_passes_the_same_input_to_both_branches() {
 
 #[test]
 fn fork_skips_right_branch_after_left_error() {
-    let left: Matcher<Vec<u64>, Vec<u64>> =
-        Matcher::identity().try_map(|_| Err(ResolveError::new_msg("left failed")));
-    let right: Matcher<Vec<u64>, Vec<u64>> =
-        Matcher::identity().map(|_| panic!("right must not run after left error"));
+    let left: Matcher<Vec<u64>, u64> =
+        Matcher::items::<u64>().try_transform_all(|_| Err(ResolveError::new_msg("left failed")));
+    let right: Matcher<Vec<u64>, u64> =
+        Matcher::items::<u64>().transform_all(|_| panic!("right must not run after left error"));
     let error = run_stage(&scan_image(), left.fork(right), vec![1]).unwrap_err();
 
     assert_eq!(error.to_string(), "left failed");
@@ -189,9 +310,9 @@ fn fork_skips_right_branch_after_left_error() {
 
 #[test]
 fn fork_propagates_right_branch_errors() {
-    let left: Matcher<Vec<u64>, Vec<u64>> = Matcher::identity();
-    let right: Matcher<Vec<u64>, Vec<u64>> =
-        Matcher::identity().try_map(|_| Err(ResolveError::new_msg("right failed")));
+    let left: Matcher<Vec<u64>, u64> = Matcher::identity();
+    let right: Matcher<Vec<u64>, u64> =
+        Matcher::items::<u64>().try_transform_all(|_| Err(ResolveError::new_msg("right failed")));
     let error = run_stage(&scan_image(), left.fork(right), vec![1]).unwrap_err();
 
     assert_eq!(error.to_string(), "right failed");
@@ -256,11 +377,206 @@ fn intersect_all_propagates_errors_even_after_an_empty_result() {
 }
 
 #[test]
-fn map_each_accepts_owned_items() {
-    let matcher = Matcher::new::<Vec<String>>().map_each(|word| word.to_uppercase());
+fn map_accepts_owned_items() {
+    let matcher = Matcher::items::<String>().map(|word| word.to_uppercase());
     let result = run_stage(&scan_image(), matcher, vec!["foo".into()]).unwrap();
 
     assert_eq!(result, ["FOO"]);
+}
+
+#[test]
+fn map_receives_one_item_and_preserves_order_and_duplicates() {
+    let matcher = Matcher::items::<u64>().map(|address| address + 1);
+    let result = run_stage(&scan_image(), matcher, vec![3, 1, 3]).unwrap();
+
+    assert_eq!(result, [4, 2, 4]);
+}
+
+#[test]
+fn candidates_accept_arrays_slices_and_vectors() {
+    let addresses = [u64::MAX, 0, u64::MAX];
+    let vector = addresses.to_vec();
+    let matchers = [
+        BinaryMatcher::candidates(addresses),
+        BinaryMatcher::candidates(addresses.as_slice()),
+        BinaryMatcher::candidates(vector),
+    ];
+    for matcher in matchers {
+        let result = run(&image(vec![]), matcher).unwrap();
+
+        assert_eq!(result, addresses);
+    }
+}
+
+#[test]
+fn candidates_allow_empty_and_singleton_collections() {
+    let empty: BinaryMatcher = BinaryMatcher::candidates([]);
+    let singleton: Matcher<(), u64, Variable> = BinaryMatcher::candidates([42]);
+
+    assert!(run(&image(vec![]), empty).unwrap().is_empty());
+    assert_eq!(run(&image(vec![]), singleton).unwrap(), [42]);
+}
+
+#[test]
+fn candidates_copy_inputs_and_can_be_resolved_repeatedly() {
+    let mut addresses = vec![3_u64, 1, 3];
+    let matcher = BinaryMatcher::candidates(&addresses);
+    addresses.fill(0);
+    let first = run(&image(vec![]), matcher.clone()).unwrap();
+    let second = run(&image(vec![]), matcher).unwrap();
+
+    assert_eq!(first, [3, 1, 3]);
+    assert_eq!(second, first);
+}
+
+#[test]
+fn candidates_compose_with_flat_map_and_selection() {
+    let matcher = BinaryMatcher::candidates([3, 1, 3])
+        .flat_map(|address| BinaryMatcher::candidates([address, address + 4]));
+    let result = run(&image(vec![]), matcher.clone()).unwrap();
+    let selected = run_stage(&image(vec![]), matcher.at_index(-2), ()).unwrap();
+
+    assert_eq!(result, [3, 7, 1, 5, 3, 7]);
+    assert_eq!(selected, 3);
+}
+
+#[test]
+fn map_skips_empty_input() {
+    let matcher =
+        Matcher::items::<u64>().map(|_| -> u64 { panic!("empty input must skip the callback") });
+    let result = run_stage(&scan_image(), matcher, vec![]).unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[test]
+fn ensure_one_accepts_repeated_equal_values_and_returns_a_scalar() {
+    for input in [vec![3_u64], vec![3, 3]] {
+        let matcher = Matcher::items::<u64>().ensure_one();
+        let result: u64 = run_stage(&scan_image(), matcher, input).unwrap();
+
+        assert_eq!(result, 3);
+    }
+}
+
+#[test]
+fn ensure_one_preserves_native_empty_and_conflicting_value_errors() {
+    for input in [vec![], vec![1_u64, 2], vec![1, 2, 3, 4, 5]] {
+        let expected = patternsleuth::resolvers::ensure_one(input.clone()).unwrap_err();
+        let matcher = Matcher::items::<u64>().ensure_one();
+        let error = run_stage(&scan_image(), matcher, input).unwrap_err();
+
+        assert_eq!(error, expected);
+    }
+}
+
+#[test]
+fn ensure_one_propagates_upstream_errors() {
+    let matcher = Matcher::from_sync(|()| -> Result<Vec<u64>> {
+        Err(ResolveError::new_msg("upstream failed"))
+    })
+    .ensure_one();
+    let error = run_stage(&scan_image(), matcher, ()).unwrap_err();
+
+    assert_eq!(error.to_string(), "upstream failed");
+}
+
+#[test]
+fn map_after_ensure_one_chains_scalar_outputs() {
+    let matcher = BinaryMatcher::address(3)
+        .ensure_one()
+        .map(|address| address + 1)
+        .map(|address| address.to_string())
+        .map(|text| text.len());
+    let result: usize = eval(&scan_image(), |ctx| Box::pin(matcher.resolve(ctx))).unwrap();
+
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn single_map_treats_a_vector_as_one_candidate() {
+    let matcher = Matcher::from_sync(|()| Ok(vec![vec![1_u64, 2, 3]]))
+        .ensure_one()
+        .map(|values| values.into_iter().rev().collect::<Vec<_>>())
+        .map(|values| values.len());
+    let result = run_stage(&scan_image(), matcher, ()).unwrap();
+
+    assert_eq!(result, 3);
+}
+
+#[test]
+fn single_map_accepts_owned_non_clone_values_and_borrowed_captures() {
+    #[derive(Debug, PartialEq)]
+    struct Candidate(String);
+    let prefix = String::from("prefix:");
+    let matcher = Matcher::from_sync(|()| Ok(vec![Candidate("payload".into())]))
+        .ensure_one()
+        .map(|candidate| format!("{prefix}{}", candidate.0));
+    let result = run_stage(&scan_image(), matcher, ()).unwrap();
+
+    assert_eq!(result, "prefix:payload");
+}
+
+#[test]
+fn single_context_maps_read_memory_and_return_to_data_only_callbacks() {
+    use patternsleuth::MemoryTrait;
+
+    let matcher = BinaryMatcher::address(TEXT + 8)
+        .ensure_one()
+        .with_context()
+        .map(|(ctx, address)| {
+            assert_eq!(ctx.image().base_address, BASE);
+            address
+        })
+        .map(|address| address + 1)
+        .with_context()
+        .try_map(|(ctx, address)| Ok(ctx.image().memory.u8(address)?))
+        .try_map(|byte| Ok(u64::from(byte)));
+    let result = run_stage(&scan_image(), matcher, ()).unwrap();
+
+    assert_eq!(result, 0xbb);
+}
+
+#[test]
+fn single_maps_skip_callbacks_after_uniqueness_errors() {
+    let matcher = Matcher::from_sync(|()| Ok(vec![1_u64, 2]))
+        .ensure_one()
+        .map(|_| -> u64 { panic!("uniqueness error must skip map") })
+        .with_context()
+        .try_map(|_| -> Result<u64> { panic!("uniqueness error must skip try_map") });
+    let error = run_stage(&scan_image(), matcher, ()).unwrap_err();
+
+    assert_eq!(
+        error,
+        patternsleuth::resolvers::ensure_one([1_u64, 2]).unwrap_err()
+    );
+}
+
+#[test]
+fn single_try_map_preserves_native_errors_and_skips_later_callbacks() {
+    let matcher = BinaryMatcher::address(TEXT)
+        .ensure_one()
+        .try_map(|_| -> Result<u64> {
+            Err(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError.into())
+        })
+        .map(|_| -> u64 { panic!("mapping error must skip later callbacks") });
+    let error = run_stage(&scan_image(), matcher, ()).unwrap_err();
+
+    assert_eq!(
+        error,
+        ResolveError::from(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError)
+    );
+}
+
+#[test]
+fn single_matchers_compose_with_scalar_input_stages() {
+    let matcher = BinaryMatcher::address(3)
+        .ensure_one()
+        .map(|value| value + 1)
+        .then(Matcher::from_sync(|value| Ok(vec![value, value])));
+    let result = run(&scan_image(), matcher).unwrap();
+
+    assert_eq!(result, [4, 4]);
 }
 
 #[test]
@@ -269,10 +585,10 @@ fn context_map_can_read_image_memory() {
 
     let matcher = BinaryMatcher::address(TEXT + 8)
         .with_context()
-        .try_map(|(ctx, addresses)| Ok(ctx.image().memory.u8(addresses[0])?));
+        .try_map(|(ctx, address)| Ok(ctx.image().memory.u8(address)?));
     let result = run_stage(&scan_image(), matcher, ()).unwrap();
 
-    assert_eq!(result, 0xaa);
+    assert_eq!(result, [0xaa]);
 }
 
 #[test]
@@ -281,7 +597,7 @@ fn context_combinators_use_each_runs_image_instead_of_capturing_one() {
 
     let matcher = BinaryMatcher::address(TEXT + 8)
         .with_context()
-        .try_map_each(|(ctx, address)| Ok(ctx.image().memory.u8(address)?));
+        .try_map(|(ctx, address)| Ok(ctx.image().memory.u8(address)?));
     let first = scan_image();
     let second = scan_image();
     let mut text = second.memory.sections()[0].data().to_vec();
@@ -292,10 +608,10 @@ fn context_combinators_use_each_runs_image_instead_of_capturing_one() {
 }
 
 #[test]
-fn context_map_each_skips_empty_input() {
-    let stage: Matcher<Vec<u64>, Vec<u64>> = Matcher::identity()
+fn context_map_skips_empty_input() {
+    let stage: Matcher<Vec<u64>, u64> = Matcher::identity()
         .with_context()
-        .try_map_each(|_| panic!("empty input must skip the callback"));
+        .try_map(|_| panic!("empty input must skip the callback"));
     let result = run_stage(&scan_image(), stage, vec![]).unwrap();
 
     assert!(result.is_empty());
@@ -307,12 +623,12 @@ fn context_adapter_evaluates_upstream_once() {
 
     let count = Mutex::new(0);
     let matcher = BinaryMatcher::address(TEXT + 8)
-        .map_each(|address| {
+        .map(|address| {
             *count.lock().unwrap() += 1;
             address
         })
         .with_context()
-        .map_each(|(_, address)| address);
+        .map(|(_, address)| address);
     run(&scan_image(), matcher).unwrap();
 
     assert_eq!(*count.lock().unwrap(), 1);
@@ -323,10 +639,10 @@ fn context_adapter_borrows_non_copy_items_without_requiring_clone() {
     struct Item {
         name: String,
     }
-    let matcher = Matcher::<Vec<Item>, Vec<Item>>::identity()
+    let matcher = Matcher::<Vec<Item>, Item>::identity()
         .with_context()
         .filter_each(|(_, item)| !item.name.is_empty())
-        .map_each(|item| item.name);
+        .map(|item| item.name);
     let input = ["foo", ""].map(|name| Item { name: name.into() }).into();
     let result = run_stage(&scan_image(), matcher, input).unwrap();
 
@@ -334,8 +650,8 @@ fn context_adapter_borrows_non_copy_items_without_requiring_clone() {
 }
 
 #[test]
-fn context_map_runs_on_empty_input() {
-    let matcher = patterns(&[]).with_context().map(|(ctx, addresses)| {
+fn context_transform_runs_on_empty_input() {
+    let matcher = patterns(&[]).with_context().transform(|(ctx, addresses)| {
         assert!(!ctx.image().memory.sections().is_empty());
         addresses.len()
     });
@@ -346,8 +662,8 @@ fn context_map_runs_on_empty_input() {
 
 #[test]
 fn context_adapter_filter_modify_stops_at_first_error_after_none() {
-    let matcher: Matcher<Vec<u64>, Vec<u64>> =
-        Matcher::identity()
+    let matcher: Matcher<Vec<u64>, u64> =
+        Matcher::items::<u64>()
             .with_context()
             .filter_modify(|(_, item)| match item {
                 1 => Ok(None),
@@ -360,8 +676,8 @@ fn context_adapter_filter_modify_stops_at_first_error_after_none() {
 }
 
 #[test]
-fn try_map_each_stops_at_the_first_error() {
-    let matcher = Matcher::new::<Vec<u64>>().try_map_each(|item| match item {
+fn try_map_stops_at_the_first_error() {
+    let matcher = Matcher::items::<u64>().try_map(|item| match item {
         1 => Ok(item),
         2 => Err(ResolveError::new_msg("item failed")),
         _ => panic!("must stop after error"),
@@ -755,14 +1071,288 @@ fn first_and_last_follow_result_order_not_address_order() {
 }
 
 #[test]
-fn selectors_accept_empty_and_singleton_inputs() {
+fn selectors_reject_empty_and_accept_singleton_inputs() {
     for wrap in [BinaryMatcher::first, BinaryMatcher::last] {
-        assert!(run(&scan_image(), wrap(patterns(&[]))).unwrap().is_empty());
+        assert!(run(&scan_image(), wrap(patterns(&[]))).is_err());
         assert_eq!(
             run(&scan_image(), wrap(BinaryMatcher::address(TEXT))).unwrap(),
             [TEXT]
         );
     }
+}
+
+#[test]
+fn at_index_selects_from_both_ends_and_returns_a_scalar() {
+    for (index, expected) in [(0, 10), (1, 20), (2, 30), (-1, 30), (-2, 20), (-3, 10)] {
+        let matcher: Matcher<Vec<u64>, u64, ExactlyOne> = Matcher::items().at_index(index);
+        let result: u64 = run_stage(&scan_image(), matcher, vec![10, 20, 30]).unwrap();
+
+        assert_eq!(result, expected);
+    }
+}
+
+#[test]
+fn at_index_rejects_empty_out_of_range_and_extreme_indices() {
+    for input in [vec![], vec![10_u64, 20, 30]] {
+        let indices = if input.is_empty() {
+            vec![0, -1]
+        } else {
+            vec![3, -4]
+        };
+        for index in indices.into_iter().chain([isize::MIN, isize::MAX]) {
+            let matcher = Matcher::items::<u64>().at_index(index);
+            let error = run_stage(&scan_image(), matcher, input.clone()).unwrap_err();
+
+            assert!(error.to_string().contains("out of range"));
+        }
+    }
+}
+
+#[test]
+fn first_and_last_match_at_index_values_and_errors() {
+    for input in [vec![], vec![10_u64], vec![10, 20, 30]] {
+        let first = run_stage(
+            &scan_image(),
+            Matcher::items::<u64>().first(),
+            input.clone(),
+        );
+        let last = run_stage(&scan_image(), Matcher::items::<u64>().last(), input.clone());
+        let at_start = run_stage(
+            &scan_image(),
+            Matcher::items::<u64>().at_index(0),
+            input.clone(),
+        );
+        let at_end = run_stage(&scan_image(), Matcher::items::<u64>().at_index(-1), input);
+
+        assert_eq!(first, at_start);
+        assert_eq!(last, at_end);
+    }
+}
+
+#[test]
+fn at_index_moves_non_clone_candidates() {
+    struct Candidate(String);
+    let matcher = Matcher::items::<Candidate>()
+        .at_index(-2)
+        .map(|candidate| candidate.0);
+    let input = ["first", "second", "third"]
+        .map(|text| Candidate(text.into()))
+        .into();
+    let result = run_stage(&scan_image(), matcher, input).unwrap();
+
+    assert_eq!(result, "second");
+}
+
+#[test]
+fn at_index_evaluates_upstream_once_and_preserves_its_error() {
+    let count = std::sync::atomic::AtomicUsize::new(0);
+    let matcher = Matcher::from_sync(|()| -> Result<Vec<u64>> {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(ResolveError::new_msg("upstream failed"))
+    })
+    .at_index(isize::MIN);
+    let error = run_stage(&scan_image(), matcher, ()).unwrap_err();
+
+    assert_eq!(error.to_string(), "upstream failed");
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cardinality_preserving_operations_work_after_selectors() {
+    let matcher: Matcher<(), u64, ExactlyOne> = patterns(&["AA BB CC"])
+        .first()
+        .offset(1)
+        .with_context()
+        .map(|(_, address)| address)
+        .try_map(Ok)
+        .addresses();
+    let result: u64 = run_stage(&scan_image(), matcher, ()).unwrap();
+
+    assert_eq!(result, TEXT + 9);
+}
+
+#[test]
+fn memory_operations_preserve_exactly_one_through_pointer_chains() {
+    let mut bytes = vec![0x90; 40];
+    relative(&mut bytes, 0, &[0xe8], TEXT + 16);
+    bytes[16..24].copy_from_slice(&(TEXT + 24).to_le_bytes());
+    bytes[24..32].copy_from_slice(&TARGET.to_le_bytes());
+    let image = image(bytes);
+    let matcher: Matcher<(), u64, ExactlyOne> = patterns(&["E8 | ?? ?? ?? ??"])
+        .ensure_one()
+        .rip4()
+        .deref()
+        .read_u64();
+    let result = run_stage(&image, matcher, ()).unwrap();
+
+    assert_eq!(result, TARGET);
+}
+
+#[test]
+fn filtering_and_expansion_return_variable_cardinality() {
+    let filtered: Matcher<(), u64> = BinaryMatcher::address(10).ensure_one().filter(|_| false);
+    let expanded: Matcher<(), u64> = BinaryMatcher::address(10)
+        .ensure_one()
+        .expand(|item| vec![item, item]);
+    let contextual: Matcher<(), u64> = BinaryMatcher::address(10)
+        .ensure_one()
+        .with_context()
+        .filter_modify(|_| Ok(None));
+
+    assert!(run_stage(&scan_image(), filtered, ()).unwrap().is_empty());
+    assert_eq!(run_stage(&scan_image(), expanded, ()).unwrap(), [10, 10]);
+    assert!(run_stage(&scan_image(), contextual, ()).unwrap().is_empty());
+}
+
+#[test]
+fn flat_map_evaluates_matchers_in_candidate_order_with_duplicates() {
+    let matcher = Matcher::items::<u64>()
+        .flat_map(|value| Matcher::from_sync(move |()| Ok(vec![value, value + 10])));
+    let result = run_stage(&scan_image(), matcher, vec![3, 1, 3]).unwrap();
+
+    assert_eq!(result, [3, 13, 1, 11, 3, 13]);
+}
+
+#[test]
+fn flat_map_accepts_exactly_one_inner_and_outer_matchers() {
+    let matcher: Matcher<(), u64> = BinaryMatcher::address(3)
+        .ensure_one()
+        .flat_map(|value| BinaryMatcher::address(value).ensure_one().offset(1));
+    let result = run_stage(&scan_image(), matcher, ()).unwrap();
+
+    assert_eq!(result, [4]);
+}
+
+#[test]
+fn flat_map_skips_empty_input_and_accepts_empty_inner_results() {
+    let empty = Matcher::items::<u64>()
+        .flat_map(|_| -> BinaryMatcher { panic!("empty input must skip matcher construction") });
+    let no_matches = BinaryMatcher::address(3).flat_map(|_| patterns(&[]));
+
+    assert!(run_stage(&scan_image(), empty, vec![]).unwrap().is_empty());
+    assert!(run_stage(&scan_image(), no_matches, ()).unwrap().is_empty());
+}
+
+#[test]
+fn flat_map_captures_non_clone_candidates_and_borrowed_data() {
+    struct Candidate(String);
+    let prefix = String::from("prefix:");
+    let matcher = Matcher::items::<Candidate>().flat_map(|candidate| {
+        let prefix = prefix.as_str();
+        Matcher::from_value(move |()| Ok(format!("{prefix}{}", candidate.0)))
+    });
+    let result = run_stage(&scan_image(), matcher, vec![Candidate("payload".into())]).unwrap();
+
+    assert_eq!(result, ["prefix:payload"]);
+}
+
+#[test]
+fn flat_map_runs_async_inner_matchers_against_the_current_image() {
+    use patternsleuth::MemoryTrait;
+
+    let matcher = Matcher::items::<u64>().flat_map(|address| {
+        Matcher::from_async(move |(), ctx| {
+            Box::pin(async move { Ok(vec![u64::from(ctx.image().memory.u8(address)?)]) })
+        })
+    });
+    let result = run_stage(&scan_image(), matcher, vec![TEXT + 8, TEXT + 9]).unwrap();
+
+    assert_eq!(result, [0xaa, 0xbb]);
+}
+
+#[test]
+fn flat_map_retains_nested_function_search_bounds() {
+    let inner = BinaryMatcher::address(3)
+        .flat_map(|_| BinaryMatcher::address(4).flat_map(|_| patterns(&["AA BB CC"])));
+    let matcher = functions(&[(TEXT, TEXT + 16)]).sub(inner);
+    let result = run(&scan_image(), matcher).unwrap();
+
+    assert_eq!(result, [TEXT + 8]);
+}
+
+#[test]
+fn flat_map_can_capture_reference_sites_while_resolving_functions() {
+    let matcher = BinaryMatcher::address(TEXT + 24).flat_map(|reference| {
+        BinaryMatcher::address(reference)
+            .root_functions()
+            .map(move |function| (reference, function.start))
+    });
+    let result = run_stage(&scan_image(), matcher, ()).unwrap();
+
+    assert_eq!(result, [(TEXT + 24, TEXT)]);
+}
+
+#[test]
+fn context_flat_map_passes_context_only_to_matcher_construction() {
+    let matcher = BinaryMatcher::address(3)
+        .with_context()
+        .flat_map(|(ctx, value)| {
+            BinaryMatcher::address(ctx.image().base_address + value).ensure_one()
+        })
+        .map(|address| address + 1);
+    let result = run_stage(&scan_image(), matcher, ()).unwrap();
+
+    assert_eq!(result, [BASE + 4]);
+}
+
+#[test]
+fn try_flat_map_stops_after_callback_errors() {
+    let matcher = Matcher::items::<u64>().try_flat_map(|value| match value {
+        1 => Ok(BinaryMatcher::address(value)),
+        2 => Err(ResolveError::new_msg("construction failed")),
+        _ => panic!("construction error must skip later candidates"),
+    });
+    let error = run_stage(&scan_image(), matcher, vec![1, 2, 3]).unwrap_err();
+
+    assert_eq!(error.to_string(), "construction failed");
+}
+
+#[test]
+fn flat_map_stops_after_inner_errors_without_constructing_later_matchers() {
+    let matcher = Matcher::items::<u64>().flat_map(|value| {
+        assert_eq!(value, 1);
+        Matcher::from_sync(|()| -> Result<Vec<u64>> {
+            Err(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError.into())
+        })
+    });
+    let error = run_stage(&scan_image(), matcher, vec![1, 2]).unwrap_err();
+
+    assert_eq!(
+        error,
+        ResolveError::from(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError)
+    );
+}
+
+#[test]
+fn flat_map_preserves_outer_errors_without_constructing_inner_matchers() {
+    let matcher =
+        Matcher::from_sync(|()| -> Result<Vec<u64>> { Err(ResolveError::new_msg("outer failed")) })
+            .flat_map(|_| -> BinaryMatcher { panic!("outer error must skip the callback") });
+    let error = run_stage(&scan_image(), matcher, ()).unwrap_err();
+
+    assert_eq!(error.to_string(), "outer failed");
+}
+
+#[test]
+fn function_sub_accepts_both_exactly_one_receivers_and_inner_matchers() {
+    let matcher: Matcher<(), u64> = BinaryMatcher::address(TEXT)
+        .root_functions()
+        .ensure_one()
+        .sub(patterns(&["AA BB CC"]).first().offset(1));
+    let result = run_stage(&scan_image(), matcher, ()).unwrap();
+
+    assert_eq!(result, [TEXT + 9]);
+}
+
+#[test]
+fn set_operations_accept_mixed_cardinalities_and_return_variable() {
+    let matcher: Matcher<(), u64> = BinaryMatcher::address(3)
+        .ensure_one()
+        .union(Matcher::from_sync(|()| Ok(vec![1, 3, 2])))
+        .intersect(BinaryMatcher::address(3).ensure_one());
+    let result = run_stage(&scan_image(), matcher, ()).unwrap();
+
+    assert_eq!(result, [3]);
 }
 
 #[test]
@@ -803,44 +1393,190 @@ fn offsets_check_unsigned_bounds_including_minimum_signed_offset() {
 }
 
 #[test]
-fn sub_receives_results_and_context_then_evaluates_returned_matcher() {
-    let matcher = patterns(&["AA DD CC"])
-        .with_context()
-        .sub(|(ctx, results)| {
-            assert_eq!(results, [TEXT + 24]);
-            assert_eq!(ctx.image().base_address, BASE);
-            Ok(patterns(&["AA BB CC"]).first())
-        });
+fn sub_scans_each_function_in_order_preserving_duplicates() {
+    let matcher = functions(&[
+        (TEXT + 24, TEXT + 28),
+        (TEXT + 8, TEXT + 12),
+        (TEXT + 24, TEXT + 28),
+    ])
+    .sub(patterns(&["AA ?? CC"]));
+
+    assert_eq!(
+        run(&scan_image(), matcher).unwrap(),
+        [TEXT + 24, TEXT + 8, TEXT + 24]
+    );
+}
+
+#[test]
+fn sub_skips_empty_functions_and_empty_ranges() {
+    for ranges in [vec![], vec![(TEXT, TEXT)]] {
+        let matcher = functions(&ranges).sub(Matcher::from_sync(|()| -> Result<Vec<u64>> {
+            panic!("empty scopes must skip the inner matcher")
+        }));
+
+        assert!(run(&scan_image(), matcher).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn sub_stops_at_the_first_inner_error() {
+    let count = std::sync::atomic::AtomicUsize::new(0);
+    let inner = Matcher::from_sync(|()| -> Result<Vec<u64>> {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(ResolveError::new_msg("inner failed"))
+    });
+    let matcher = functions(&[(TEXT, TEXT + 8), (TEXT + 8, TEXT + 16)]).sub(inner);
+
+    assert_eq!(
+        run(&scan_image(), matcher).unwrap_err().to_string(),
+        "inner failed"
+    );
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+fn functions<'scope>(ranges: &[(u64, u64)]) -> Matcher<'scope, (), FunctionEntry> {
+    let entries = ranges
+        .iter()
+        .map(|&(start, end)| FunctionEntry {
+            start,
+            end,
+            unwind: None,
+        })
+        .collect::<Vec<_>>();
+    Matcher::from_sync(move |()| Ok(entries.clone()))
+}
+
+#[test]
+fn sub_requires_the_complete_pattern_to_fit_and_retains_markers() {
+    let image = image(vec![0xaa, 0xbb, 0xcc, 0xaa, 0xbb, 0xcc]);
+    let matcher = functions(&[(TEXT, TEXT + 5)]).sub(patterns(&["AA | BB CC"]));
+
+    assert_eq!(run(&image, matcher).unwrap(), [TEXT + 1]);
+    assert!(
+        run(
+            &image,
+            functions(&[(TEXT + 1, TEXT + 6)]).sub(patterns(&["AA BB CC"]))
+        )
+        .unwrap()
+        .contains(&(TEXT + 3))
+    );
+}
+
+#[test]
+fn sub_nested_scopes_intersect_and_restore_the_parent() {
+    let inner = functions(&[(TEXT, TEXT + 64), (TEXT + 64, TEXT + 80)])
+        .sub(patterns(&["AA ?? CC"]))
+        .union(patterns(&["AA DD CC"]));
+    let matcher = functions(&[(TEXT + 8, TEXT + 27)])
+        .sub(inner)
+        .union(patterns(&["AA BB CC"]));
+
+    assert_eq!(
+        run(&scan_image(), matcher).unwrap(),
+        [TEXT + 8, TEXT + 24, TARGET]
+    );
+}
+
+#[test]
+fn sub_allows_rip_targets_and_reads_outside_the_function() {
+    let mut bytes = vec![0x90; 32];
+    relative(&mut bytes, 0, &[0x48, 0x8b, 0x05], TEXT + 16);
+    bytes[16..24].copy_from_slice(&TARGET.to_le_bytes());
+    let image = image(bytes);
+    let matcher =
+        functions(&[(TEXT, TEXT + 7)]).sub(patterns(&["48 8B 05 | ?? ?? ?? ??"]).rip4().deref());
+
+    assert_eq!(run(&image, matcher).unwrap(), [TARGET]);
+}
+
+#[test]
+fn sub_scopes_reference_and_caller_scans() {
+    let mut bytes = vec![0x90; 96];
+    relative(&mut bytes, 0, &[0x48, 0x8d, 0x05], TARGET);
+    relative(&mut bytes, 8, &[0xe8], TARGET);
+    relative(&mut bytes, 64, &[0x48, 0x8d, 0x05], TARGET);
+    relative(&mut bytes, 72, &[0xe8], TARGET);
+    let image = image(bytes);
+    let references =
+        functions(&[(TEXT, TEXT + 64)]).sub(BinaryMatcher::address(TARGET).references());
+    let callers = functions(&[(TEXT, TEXT + 64)]).sub(BinaryMatcher::address(TARGET).callers());
+
+    assert_eq!(run(&image, references).unwrap(), [TEXT]);
+    assert_eq!(run(&image, callers).unwrap(), [TEXT + 8]);
+}
+
+#[test]
+fn sub_rejects_reversed_function_ranges() {
+    let matcher = functions(&[(TEXT + 8, TEXT)]).sub(patterns(&["AA"]));
+
+    assert!(
+        run(&scan_image(), matcher)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid function range")
+    );
+}
+
+#[test]
+fn sub_accepts_native_function_entries() {
+    let matcher = BinaryMatcher::address(TEXT + 24)
+        .root_functions()
+        .sub(patterns(&["AA BB CC"]));
+
     assert_eq!(run(&scan_image(), matcher).unwrap(), [TEXT + 8]);
 }
 
 #[test]
-fn sub_runs_on_empty_input_and_can_return_another_sub() {
-    let matcher = patterns(&[]).sub(|results| {
-        assert!(results.is_empty());
-        Ok(BinaryMatcher::address(42)
-            .sub(|results| Ok(BinaryMatcher::address(results[0]).offset(-2))))
+fn sub_scopes_custom_async_scans_and_context_callbacks() {
+    let inner = Matcher::from_async(|(), ctx| {
+        Box::pin(async move {
+            assert_eq!(ctx.bounds(), Some(TEXT..TEXT + 16));
+            Ok(ctx.scan(Pattern::new("AA BB CC").unwrap()).await)
+        })
+    })
+    .with_context()
+    .map(|(ctx, address)| {
+        assert_eq!(ctx.bounds(), Some(TEXT..TEXT + 16));
+        address
     });
-    assert_eq!(run(&scan_image(), matcher).unwrap(), [40]);
+    let matcher = functions(&[(TEXT, TEXT + 16)]).sub(inner);
+
+    assert_eq!(run(&scan_image(), matcher).unwrap(), [TEXT + 8]);
 }
 
 #[test]
-fn sub_propagates_callback_and_returned_matcher_errors() {
-    let callback_error =
-        BinaryMatcher::address(1).sub(|_| Err(ResolveError::new_msg("callback failed")));
+fn sub_limits_traversal_sites_but_not_call_targets() {
+    let mut bytes = vec![0x90; 128];
+    relative(&mut bytes, 0, &[0x0f, 0x84], TEXT + 32);
+    relative(&mut bytes, 8, &[0xe8], TARGET);
+    relative(&mut bytes, 16, &[0xe8], TARGET + 8);
+    relative(&mut bytes, 32, &[0xe8], TARGET + 16);
+    let image = image(bytes);
+    let matcher = functions(&[(TEXT, TEXT + 18)]).sub(BinaryMatcher::address(TEXT).callees());
+
+    assert_eq!(run(&image, matcher).unwrap(), [TARGET]);
+}
+
+#[test]
+fn sub_propagates_outer_errors_without_running_the_inner_matcher() {
+    let outer = Matcher::from_sync(|()| -> Result<Vec<FunctionEntry>> {
+        Err(ResolveError::new_msg("outer failed"))
+    });
+    let matcher = outer.sub(Matcher::from_sync(|()| -> Result<Vec<u64>> {
+        panic!("outer error must skip the inner matcher")
+    }));
+
     assert_eq!(
-        run(&scan_image(), callback_error).unwrap_err().to_string(),
-        "callback failed"
+        run(&scan_image(), matcher).unwrap_err().to_string(),
+        "outer failed"
     );
-    let returned_error = patterns(&[]).sub(|_| Ok(BinaryMatcher::address(0).offset(-1)));
-    assert!(run(&scan_image(), returned_error).is_err());
 }
 
 #[test]
 fn all_wrappers_propagate_inner_errors() {
     let wrappers: [for<'a> fn(BinaryMatcher<'a>) -> BinaryMatcher<'a>; 3] = [
-        |matcher| matcher.first(),
-        |matcher| matcher.last(),
+        |matcher| matcher.first().into_variable(),
+        |matcher| matcher.last().into_variable(),
         |matcher| matcher.xrefs().addresses(),
     ];
     for wrap in wrappers {
@@ -855,7 +1591,7 @@ fn all_wrappers_propagate_inner_errors() {
     );
     let matcher = BinaryMatcher::address(0)
         .offset(-1)
-        .sub(|_| panic!("callback must not run after an inner error"));
+        .transform_all(|_| -> Vec<u64> { panic!("callback must not run after an inner error") });
     assert!(run(&scan_image(), matcher).is_err());
 }
 

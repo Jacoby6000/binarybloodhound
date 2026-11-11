@@ -1,7 +1,6 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/guobject_array.rs>
 
-use std::fmt::Debug;
-
+use binary_bloodhound::BinaryMatcher;
 use futures::{future::join_all, join, try_join};
 
 use super::scan::{scan, scan_tagged};
@@ -10,15 +9,10 @@ use patternsleuth::scanner::Pattern;
 use super::util;
 use patternsleuth::{
     Addressable, MemoryTrait,
-    resolvers::{Result, ensure_one, impl_resolver_singleton, try_ensure_one},
+    resolvers::{Result, impl_resolver_singleton, try_ensure_one},
 };
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct GUObjectArray(pub u64);
+pub use super::models::objects::GUObjectArray;
 impl_resolver_singleton!(all, GUObjectArray, |ctx| async {
     let patterns = [
         "8B 05 ?? ?? ?? ?? 3B 05 ?? ?? ?? ?? 75 ?? 48 8D 15 ?? ?? ?? ?? 48 8D 0D | ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8D 05",
@@ -120,30 +114,21 @@ impl_resolver_singleton!(all, GUObjectArray, |ctx| async {
 });
 
 /// public: void __cdecl FUObjectArray::AllocateUObjectIndex(class UObjectBase *, bool)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FUObjectArrayAllocateUObjectIndex(pub u64);
+pub use super::models::objects::FUObjectArrayAllocateUObjectIndex;
 impl_resolver_singleton!(all, FUObjectArrayAllocateUObjectIndex, |ctx| async {
-    let strings = util::string_pattern(
-        ctx,
-        "Unable to add more objects to disregard for GC pool (Max: %d)\0",
-    )
-    .await;
-    let refs = util::scan_xrefs(ctx, &strings).await;
-    let fns = util::root_functions(ctx, &refs)?;
-    Ok(Self(ensure_one(fns)?))
+    let message = "Unable to add more objects to disregard for GC pool (Max: %d)\0";
+    BinaryMatcher::patterns([util::utf16_pattern(message), util::utf8_pattern(message)])?
+        .references()
+        .root_functions()
+        .addresses()
+        .ensure_one()
+        .map(Self)
+        .resolve(ctx)
+        .await
 });
 
 /// public: void __cdecl FUObjectArray::FreeUObjectIndex(class UObjectBase *)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FUObjectArrayFreeUObjectIndex(pub u64);
+pub use super::models::objects::FUObjectArrayFreeUObjectIndex;
 impl_resolver_singleton!(all, FUObjectArrayFreeUObjectIndex, |ctx| async {
     let refs_future = async {
         let search_strings = [
@@ -168,50 +153,44 @@ impl_resolver_singleton!(all, FUObjectArrayFreeUObjectIndex, |ctx| async {
         refs_future,
     )?;
 
-    let fns = refs
-        .into_iter()
-        .map(|r| -> Result<_> { Ok(ctx.image().get_root_function(r)?.map(|f| f.range.start)) })
-        .collect::<Result<Vec<_>>>()? // TODO avoid this collect?
-        .into_iter()
-        .flatten()
-        .filter(|f| *f != allocate_uobject.0);
-
-    Ok(FUObjectArrayFreeUObjectIndex(ensure_one(fns)?))
+    BinaryMatcher::candidates(refs)
+        .root_functions()
+        .addresses()
+        .filter(|address| address != allocate_uobject.0)
+        .ensure_one()
+        .map(Self)
+        .resolve(ctx)
+        .await
 });
 
 /// void __cdecl UObjectBaseShutdown(void)
 /// could be used to determine object listener offsets, but only for recent UE versions
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct UObjectBaseShutdown(pub u64);
+pub use super::models::objects::UObjectBaseShutdown;
 impl_resolver_singleton!(collect, UObjectBaseShutdown);
 
 impl_resolver_singleton!(PEImage, UObjectBaseShutdown, |ctx| async {
-    let strings = util::string_pattern(
-        ctx,
-        "All UObject delete listeners should be unregistered when shutting down the UObject array\0",
-    )
-    .await;
-    let refs = util::scan_xrefs(ctx, &strings).await;
-    let fns = util::root_functions(ctx, &refs)?;
-    Ok(UObjectBaseShutdown(ensure_one(fns)?))
+    let message = "All UObject delete listeners should be unregistered when shutting down the UObject array\0";
+    BinaryMatcher::patterns([util::utf16_pattern(message), util::utf8_pattern(message)])?
+        .references()
+        .root_functions()
+        .addresses()
+        .ensure_one()
+        .map(Self)
+        .resolve(ctx)
+        .await
 });
 
 impl_resolver_singleton!(ElfImage, UObjectBaseShutdown, |ctx| async {
-    let strings = util::string_pattern(
-        ctx,
-        "All UObject delete listeners should be unregistered when shutting down the UObject array\0",
-    )
-    .await;
-    let refs = util::scan_xrefs(ctx, &strings).await;
-    let fns = util::root_functions(ctx, &refs)?;
-    let fns = {
-        // on linux both functions are not inlined, we need to find the caller
-        let callsites = util::scan_xcalls(ctx, &fns).await;
-        util::root_functions(ctx, &callsites)?
-    };
-    Ok(UObjectBaseShutdown(ensure_one(fns)?))
+    let message = "All UObject delete listeners should be unregistered when shutting down the UObject array\0";
+    BinaryMatcher::patterns([util::utf16_pattern(message), util::utf8_pattern(message)])?
+        .references()
+        .root_functions()
+        // On Linux both functions are not inlined; find the caller.
+        .callers()
+        .root_functions()
+        .addresses()
+        .ensure_one()
+        .map(Self)
+        .resolve(ctx)
+        .await
 });

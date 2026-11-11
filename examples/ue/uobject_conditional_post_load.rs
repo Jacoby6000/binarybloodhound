@@ -101,12 +101,7 @@ fn match_postloading_assignments_tail(
     false
 }
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct UObjectConditionalPostLoad(pub u64);
+pub use super::models::objects::UObjectConditionalPostLoad;
 impl_resolver_singleton!(all, UObjectConditionalPostLoad, |ctx| async {
     #[derive(Copy, Clone, PartialEq, Eq)]
     enum V {

@@ -1,6 +1,6 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/static_construct_object.rs>
 
-use std::{collections::HashSet, fmt::Debug};
+use std::collections::HashSet;
 
 use super::scan::scan;
 use binary_bloodhound::BinaryMatcher;
@@ -10,18 +10,12 @@ use {super::scan::scan_tagged2, futures::future::join_all, patternsleuth::scanne
 
 use super::util;
 use patternsleuth::{
-    MemoryTrait,
     disassemble::{Control, disassemble},
     resolvers::{ensure_one, impl_resolver_singleton},
 };
 
 /// class UObject * __cdecl StaticConstructObject_Internal(struct FStaticConstructObjectParameters const &)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct StaticConstructObjectInternal(pub u64);
+pub use super::models::objects::StaticConstructObjectInternal;
 impl_resolver_singleton!(all, StaticConstructObjectInternal, |ctx| async {
     let any = join!(
         ctx.resolve(StaticConstructObjectInternalPatterns::resolver()),
@@ -35,12 +29,7 @@ impl_resolver_singleton!(all, StaticConstructObjectInternal, |ctx| async {
     )?))
 });
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct StaticConstructObjectInternalPatterns(pub u64);
+pub use super::models::objects::StaticConstructObjectInternalPatterns;
 impl_resolver_singleton!(all, StaticConstructObjectInternalPatterns, |ctx| async {
     let patterns = [
         "48 89 44 24 28 C7 44 24 20 00 00 00 00 E8 | ?? ?? ?? ?? 48 8B 5C 24 ?? 48 8B ?? 24",
@@ -62,20 +51,14 @@ impl_resolver_singleton!(all, StaticConstructObjectInternalPatterns, |ctx| async
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .with_context()
-        .try_map_each(|(ctx, address)| Ok(ctx.image().memory.rip4(address)?))
-        .try_map(ensure_one)
+        .rip4()
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
 });
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct StaticConstructObjectInternalString(pub u64);
+pub use super::models::objects::StaticConstructObjectInternalString;
 impl_resolver_singleton!(collect, StaticConstructObjectInternalString);
 impl_resolver_singleton!(ElfImage, StaticConstructObjectInternalString, |ctx| async {
     let strings = scan(

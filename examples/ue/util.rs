@@ -1,6 +1,6 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/mod.rs#L34-L251>
 
-use binary_bloodhound::{BinaryMatcher, stages};
+use binary_bloodhound::BinaryMatcher;
 use patternsleuth::resolvers::AsyncContext;
 
 pub use patternsleuth::resolvers::unreal::util::{
@@ -20,9 +20,10 @@ pub async fn scan_xrefs(
     addresses: impl IntoIterator<Item = &u64>,
 ) -> Vec<u64> {
     let addresses: Vec<_> = addresses.into_iter().copied().collect();
-    stages::references()
+    BinaryMatcher::candidates(addresses)
+        .references()
         .addresses()
-        .run(addresses, ctx)
+        .resolve(ctx)
         .await
         .expect("reference scan")
 }
@@ -32,9 +33,10 @@ pub async fn scan_xcalls(
     addresses: impl IntoIterator<Item = &u64>,
 ) -> Vec<u64> {
     let addresses: Vec<_> = addresses.into_iter().copied().collect();
-    stages::callers()
+    BinaryMatcher::candidates(addresses)
+        .callers()
         .addresses()
-        .run(addresses, ctx)
+        .resolve(ctx)
         .await
         .expect("caller scan")
 }

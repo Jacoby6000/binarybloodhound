@@ -1,10 +1,6 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/engine_version.rs>
 
-use std::{
-    collections::BTreeSet,
-    fmt::{Debug, Display},
-    str::FromStr,
-};
+use std::collections::BTreeSet;
 
 use futures::future::join_all;
 
@@ -20,40 +16,7 @@ use patternsleuth::{
     resolvers::{AsyncContext, ResolveError, bail_out, impl_resolver, impl_resolver_singleton},
 };
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct EngineVersion {
-    pub major: u16,
-    pub minor: u16,
-}
-impl Display for EngineVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}", self.major, self.minor)
-    }
-}
-impl Debug for EngineVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EngineVersion({}.{})", self.major, self.minor)
-    }
-}
-impl FromStr for EngineVersion {
-    type Err = ResolveError;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let (major, minor) = s
-            .split_once('.')
-            .ok_or(ResolveError::new_msg("expected <major>.<minor e.g.: 5.4"))?;
-        let major = major
-            .parse::<u16>()
-            .map_err(|e| ResolveError::new_msg(e.to_string()))?;
-        let minor = minor
-            .parse::<u16>()
-            .map_err(|e| ResolveError::new_msg(e.to_string()))?;
-        Ok(Self { major, minor })
-    }
-}
+pub use super::models::version::EngineVersion;
 
 #[rustfmt::skip]
 const VERSION_PATTERNS: &[&str] = &[
@@ -298,22 +261,7 @@ impl_resolver!(all, EngineVersion, |ctx| async {
 });
 
 /// currently seems to be 4.22+
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct EngineVersionStrings {
-    pub branch_name: String,
-    pub build_date: String,
-    pub build_version: String,
-}
-impl FromStr for EngineVersionStrings {
-    type Err = ResolveError;
-    fn from_str(_s: &str) -> std::result::Result<Self, Self::Err> {
-        Err(ResolveError::new_msg("unimplemented"))
-    }
-}
+pub use super::models::version::EngineVersionStrings;
 impl_resolver!(collect, EngineVersionStrings);
 // "++UE5+Release-{}.{}"
 impl_resolver!(ElfImage, EngineVersionStrings, |ctx| async {
@@ -413,134 +361,22 @@ impl_resolver!(PEImage, EngineVersionStrings, |ctx| async {
     bail_out!("not found");
 });
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct CustomVersionRegistry(u64);
+pub use super::models::custom_versions::CustomVersionRegistry;
 impl_resolver_singleton!(all, CustomVersionRegistry, |ctx| async {
     let patterns = [
         "75 de 48 8d 1d | ?? ?? ?? ?? 48 8b cb ff 15 ?? ?? ?? ?? 66 0f 6f 05 ?? ?? ?? ?? 48 8d 0d ?? ?? ?? ?? 33 c0",
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .with_context()
-        .try_map_each(|(ctx, address)| Ok(ctx.image().memory.rip4(address)?))
-        .try_map(ensure_one)
+        .rip4()
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
 });
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct Guid([u8; 16]);
-
-impl std::fmt::Debug for Guid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{")?;
-        for (i, byte) in self.0.iter().enumerate() {
-            if i == 4 || i == 6 || i == 8 || i == 10 {
-                f.write_str("-")?;
-            }
-            write!(f, "{:02x}", byte)?;
-        }
-        write!(f, "}}")
-    }
-}
-
-#[cfg(feature = "serde-resolvers")]
-impl serde::Serialize for Guid {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let hex_string = self
-            .0
-            .iter()
-            .map(|byte| format!("{:02x}", byte))
-            .collect::<String>();
-
-        serializer.serialize_str(&hex_string)
-    }
-}
-
-#[cfg(feature = "serde-resolvers")]
-impl<'de> serde::Deserialize<'de> for Guid {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct GuidVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for GuidVisitor {
-            type Value = Guid;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a hex string of 32 characters")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Guid, E>
-            where
-                E: serde::de::Error,
-            {
-                let clean = value.replace("-", "");
-
-                if clean.len() != 32 {
-                    return Err(E::custom(format!(
-                        "expected 32 hex characters, got {}",
-                        clean.len()
-                    )));
-                }
-
-                let mut bytes = [0u8; 16];
-                for i in 0..16 {
-                    let byte_str = &clean[i * 2..i * 2 + 2];
-                    bytes[i] =
-                        u8::from_str_radix(byte_str, 16).map_err(|_| E::custom("invalid GUID"))?;
-                }
-
-                Ok(Guid(bytes))
-            }
-        }
-
-        deserializer.deserialize_str(GuidVisitor)
-    }
-}
-
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-struct CustomVersion {
-    guid: Guid,
-    version: u32,
-    name: String,
-}
-impl std::fmt::Debug for CustomVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "CustomVersion({:?}, {:>3}, {})",
-            self.guid, self.version, self.name
-        )
-    }
-}
-
-impl FromStr for StaticCustomVersions {
-    type Err = ResolveError;
-    fn from_str(_s: &str) -> Result<Self, Self::Err> {
-        Err(ResolveError::new_msg("unimplemented"))
-    }
-}
-
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct StaticCustomVersions(BTreeSet<CustomVersion>);
+pub use super::models::custom_versions::StaticCustomVersions;
+use super::models::custom_versions::{CustomVersion, Guid};
 impl_resolver!(all, StaticCustomVersions, |ctx| async {
     enum V {
         A,
@@ -642,19 +478,7 @@ impl_resolver!(all, StaticCustomVersions, |ctx| async {
 });
 
 /// Build changelist version string (e.g., "main-CL-89524" or "++UE4+Release-4.22-CL-0")
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct BuildChangeList(pub String);
-
-impl FromStr for BuildChangeList {
-    type Err = ResolveError;
-    fn from_str(_s: &str) -> std::result::Result<Self, Self::Err> {
-        Err(ResolveError::new_msg("unimplemented"))
-    }
-}
+pub use super::models::build::BuildChangeList;
 
 impl_resolver!(all, BuildChangeList, |ctx| async {
     use iced_x86::{Code, OpKind, Register};
@@ -725,15 +549,7 @@ impl_resolver!(all, BuildChangeList, |ctx| async {
 });
 
 /// InternalProjectName. GInternalProjectName in UE code, compiled_in_project_name will be unset if executable is a game agnostic executable
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct InternalProjectName {
-    pub internal_project_name: u64,
-    pub compiled_in_project_name: Option<String>,
-}
+pub use super::models::build::InternalProjectName;
 impl_resolver!(all, InternalProjectName, |ctx| async {
     let strings = join_all([
         scan(ctx, util::utf16_pattern("UE4-%s\0")), // UE4
@@ -758,9 +574,8 @@ impl_resolver!(all, InternalProjectName, |ctx| async {
         })
         .collect_vec();
     let internal_project_name = BinaryMatcher::patterns(patterns)?
-        .with_context()
-        .try_map_each(|(ctx, address)| Ok(ctx.image().memory.rip4(address)?))
-        .try_map(ensure_one)
+        .rip4()
+        .ensure_one()
         .resolve(ctx)
         .await?;
     let is_bss_section = ctx
@@ -779,12 +594,6 @@ impl_resolver!(all, InternalProjectName, |ctx| async {
         compiled_in_project_name,
     })
 });
-impl FromStr for InternalProjectName {
-    type Err = ResolveError;
-    fn from_str(_s: &str) -> std::result::Result<Self, Self::Err> {
-        Err(ResolveError::new_msg("unimplemented"))
-    }
-}
 
 const fn v(major: u16, minor: u16) -> EngineVersion {
     EngineVersion { major, minor }
@@ -799,52 +608,11 @@ const VERSIONS: &[EngineVersion] = &[
     v(5, 3), v(5, 4), v(5, 5), v(5, 6), v(5, 7), v(5, 8),
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub enum BuildConfiguration {
-    /// Also Debug and DebugGame
-    Development,
-    Test,
-    Shipping,
-}
-impl FromStr for BuildConfiguration {
-    type Err = ResolveError;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "Development" => Ok(Self::Development),
-            "Test" => Ok(Self::Test),
-            "Shipping" => Ok(Self::Shipping),
-            _ => Err(ResolveError::new_msg(
-                "expected Development, Test or Shipping",
-            )),
-        }
-    }
-}
+pub use super::models::build::BuildConfiguration;
 
 /// The `STATS` macro. Defaults off in Test and Shipping, but any target can
 /// force it back on, so it doesn't follow from the configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub enum Stats {
-    Off,
-    On,
-}
-impl FromStr for Stats {
-    type Err = ResolveError;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "Off" => Ok(Self::Off),
-            "On" => Ok(Self::On),
-            _ => Err(ResolveError::new_msg("expected On or Off")),
-        }
-    }
-}
+pub use super::models::build::Stats;
 
 #[derive(Debug, Clone, Copy)]
 struct Build {
@@ -1227,18 +995,7 @@ async fn fingerprint(ctx: &AsyncContext<'_>) -> patternsleuth::resolvers::Result
     Ok(costs(&present))
 }
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct EngineVersionFingerprint(pub EngineVersion);
-impl FromStr for EngineVersionFingerprint {
-    type Err = ResolveError;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        Ok(Self(s.parse()?))
-    }
-}
+pub use super::models::version::EngineVersionFingerprint;
 
 impl_resolver!(all, EngineVersionFingerprint, |ctx| async {
     let costs = fingerprint(ctx).await?;

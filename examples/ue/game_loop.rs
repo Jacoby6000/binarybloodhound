@@ -1,11 +1,10 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/game_loop.rs>
 
-use std::fmt::Debug;
-
 use binary_bloodhound::BinaryMatcher;
 #[cfg(feature = "image-pe")]
 use {
-    super::scan::{scan, scan_tagged},
+    super::scan::scan_tagged,
+    binary_bloodhound::Matcher,
     futures::future::join_all,
     std::{
         cmp::Reverse,
@@ -14,21 +13,16 @@ use {
 };
 
 use super::util;
-use patternsleuth::resolvers::{bail_out, ensure_one, impl_resolver_singleton};
+use patternsleuth::resolvers::{bail_out, impl_resolver_singleton};
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct Main(pub u64);
+pub use super::models::engine::Main;
 impl_resolver_singleton!(collect, Main);
 impl_resolver_singleton!(PEImage, Main, |ctx| async {
     BinaryMatcher::pattern(util::utf16_pattern("UnrealEngine4\0"))
         .references()
         .root_functions()
         .addresses()
-        .try_map(ensure_one)
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
@@ -37,68 +31,63 @@ impl_resolver_singleton!(ElfImage, Main, |_ctx| async {
     bail_out!("ElfImage unimplemented");
 });
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FEngineLoopTick(pub u64);
+pub use super::models::engine::FEngineLoopTick;
 impl_resolver_singleton!(collect, FEngineLoopTick);
 impl_resolver_singleton!(PEImage, FEngineLoopTick, |ctx| async {
     // intersect the always-present anchor with each secondary and union the results
     let primary = "t.IdleWhenNotForeground\0";
     let secondaries = ["r.OneFrameThreadLag\0", "FEngineLoop::Tick.Benchmarking\0"];
 
-    let primary_strings = scan(ctx, util::utf16_pattern(primary)).await;
-    let primary_fns = util::root_functions(ctx, &util::scan_xrefs(ctx, &primary_strings).await)?;
+    let primary_fns = BinaryMatcher::pattern(util::utf16_pattern(primary))
+        .references()
+        .root_functions()
+        .addresses()
+        .resolve(ctx)
+        .await?;
 
     let secondary_fns: Vec<Vec<_>> = join_all(secondaries.map(|s| async move {
-        let strings = scan(ctx, util::utf16_pattern(s)).await;
-        util::root_functions(ctx, &util::scan_xrefs(ctx, &strings).await)
+        BinaryMatcher::pattern(util::utf16_pattern(s))
+            .references()
+            .root_functions()
+            .addresses()
+            .resolve(ctx)
+            .await
     }))
     .await
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
 
-    let mut candidates: Vec<u64> = vec![];
-    for sec in &secondary_fns {
-        for f in &primary_fns {
-            if sec.contains(f) && !candidates.contains(f) {
-                candidates.push(*f);
-            }
-        }
-    }
-
-    Ok(Self(ensure_one(candidates)?))
+    // Reuse the resolved primary candidates; do not rescan the anchor per branch.
+    let primary = BinaryMatcher::candidates(primary_fns);
+    let branches = secondary_fns.into_iter().map(|secondary| {
+        primary
+            .clone()
+            .intersect(BinaryMatcher::candidates(secondary))
+    });
+    Matcher::union_all(branches)
+        .ensure_one()
+        .map(Self)
+        .resolve(ctx)
+        .await
 });
 impl_resolver_singleton!(ElfImage, FEngineLoopTick, |_ctx| async {
     bail_out!("ElfImage unimplemented");
 });
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct UGameEngineTick(pub u64);
+pub use super::models::engine::UGameEngineTick;
 impl_resolver_singleton!(all, UGameEngineTick, |ctx| async {
     BinaryMatcher::patterns(["causeevent=\0", "CAUSEEVENT \0"].map(util::utf16_pattern))?
         .references()
         .root_functions()
         .addresses()
-        .try_map(ensure_one)
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
 });
 
 /// int32_t FEngineLoop::Init(class FEngineLoop* this)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FEngineLoopInit(pub u64);
+pub use super::models::engine::FEngineLoopInit;
 impl_resolver_singleton!(collect, FEngineLoopInit);
 
 impl_resolver_singleton!(PEImage, FEngineLoopInit, |ctx| async {
@@ -111,7 +100,7 @@ impl_resolver_singleton!(PEImage, FEngineLoopInit, |ctx| async {
         .references()
         .root_functions()
         .addresses()
-        .try_map(ensure_one)
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
@@ -127,19 +116,14 @@ impl_resolver_singleton!(ElfImage, FEngineLoopInit, |ctx| async {
         .references()
         .root_functions()
         .addresses()
-        .try_map(ensure_one)
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
 });
 
 /// void UWorld::Tick(ELevelTick TickType, float DeltaSeconds)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct UWorldTick(pub u64);
+pub use super::models::engine::UWorldTick;
 impl_resolver_singleton!(collect, UWorldTick);
 impl_resolver_singleton!(PEImage, UWorldTick, |ctx| async {
     const UWORLD_TICK_SPECIFIC: &[&str] = &[

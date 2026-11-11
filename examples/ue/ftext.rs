@@ -13,12 +13,7 @@ use patternsleuth::{
 };
 
 /// private: __cdecl FText::FText(class FString &&)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FTextFString(pub u64);
+pub use super::models::ftext::FTextFString;
 impl_resolver_singleton!(all, FTextFString, |ctx| async {
     #[derive(Debug)]
     enum Directness {

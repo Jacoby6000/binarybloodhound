@@ -1,7 +1,5 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/fname.rs>
 
-use std::fmt::Debug;
-
 use futures::future::join_all;
 
 #[cfg(feature = "image-pe")]
@@ -11,19 +9,18 @@ use binary_bloodhound::BinaryMatcher;
 use patternsleuth::scanner::Pattern;
 
 use super::util;
+#[cfg(feature = "image-elf")]
+use patternsleuth::MemoryTrait;
 use patternsleuth::resolvers::ResolveError;
+#[cfg(feature = "image-pe")]
+use patternsleuth::resolvers::try_ensure_one;
 use patternsleuth::{
-    Addressable, MemoryTrait,
-    resolvers::{Result, ensure_one, impl_resolver_singleton, try_ensure_one},
+    Addressable,
+    resolvers::{Result, ensure_one, impl_resolver_singleton},
 };
 
 /// public: __cdecl FName::FName(wchar_t const *, enum EFindName)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FNameCtorWchar(pub u64);
+pub use super::models::fname::FNameCtorWchar;
 impl_resolver_singleton!(collect, FNameCtorWchar);
 
 // FEngineLoop::LoadPreInitModules constructs each module's FName before loading it.
@@ -112,16 +109,21 @@ impl_resolver_singleton!(PEImage, FNameCtorWchar, |ctx| async {
 
     // prefer the direct prologue match when present
     if !ctor.is_empty() {
-        return Ok(Self(try_ensure_one(ctor.into_iter().map(Ok))?));
+        return BinaryMatcher::candidates(ctor)
+            .ensure_one()
+            .map(Self)
+            .resolve(ctx)
+            .await;
     }
 
     // sometimes the call gets inlined so use patterns if any match
     if !patterns.is_empty() {
-        return Ok(Self(try_ensure_one(
-            patterns
-                .iter()
-                .map(|a| -> Result<_> { Ok(ctx.image().memory.rip4(*a)?) }),
-        )?));
+        return BinaryMatcher::candidates(patterns)
+            .rip4()
+            .ensure_one()
+            .map(Self)
+            .resolve(ctx)
+            .await;
     }
 
     #[derive(Clone, Copy)]
@@ -182,25 +184,22 @@ impl_resolver_singleton!(PEImage, FNameCtorWchar, |ctx| async {
 /// !! Be aware anyone try play with this code in Linux, they're different and you should stick with the
 /// second one.
 ///
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FNameToString(pub u64);
+pub use super::models::fname::FNameToString;
 impl_resolver_singleton!(collect, FNameToString);
 
 impl_resolver_singleton!(ElfImage, FNameToString, |ctx| async {
-    let strings = scan(ctx, util::utf16_pattern("SkySphereMesh\0")).await;
-    let str_addr = ensure_one(strings)?;
-    let pattern = Pattern::new(format!(
-        "e8 | ?? ?? ?? ?? 49 8b 5f 10 48 8d 7c 24 30 be 0x{str_addr:08x}"
-    ))
-    .unwrap();
-    let refs = scan(ctx, pattern).await;
-    Ok(Self(try_ensure_one(
-        refs.into_iter().map(|a| Ok(ctx.image().memory.rip4(a)?)),
-    )?))
+    BinaryMatcher::patterns([util::utf16_pattern("SkySphereMesh\0")])?
+        .ensure_one()
+        .try_flat_map(|str_addr| {
+            BinaryMatcher::patterns([format!(
+                "e8 | ?? ?? ?? ?? 49 8b 5f 10 48 8d 7c 24 30 be 0x{str_addr:08x}"
+            )])
+        })
+        .rip4()
+        .ensure_one()
+        .map(Self)
+        .resolve(ctx)
+        .await
 });
 
 impl_resolver_singleton!(PEImage, FNameToString, |ctx| async {
@@ -282,12 +281,7 @@ impl_resolver_singleton!(PEImage, FNameToString, |ctx| async {
 });
 
 /// public: class FString __cdecl FName::ToString(void) const
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FNameToStringVoid(pub u64);
+pub use super::models::fname::FNameToStringVoid;
 impl_resolver_singleton!(all, FNameToStringVoid, |ctx| async {
     let patterns = [
         "E8 | ?? ?? ?? ?? ?? 01 00 00 00 ?? 39 ?? 48 0F 8E",
@@ -296,29 +290,22 @@ impl_resolver_singleton!(all, FNameToStringVoid, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .with_context()
-        .try_map_each(|(ctx, address)| Ok(ctx.image().memory.rip4(address)?))
-        .try_map(ensure_one)
+        .rip4()
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
 });
 
 /// public: void __cdecl FName::ToString(class FString &) const
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FNameToStringFString(pub u64);
+pub use super::models::fname::FNameToStringFString;
 impl_resolver_singleton!(all, FNameToStringFString, |ctx| async {
     let patterns =
         ["48 8b 48 ?? 48 89 4c 24 ?? 48 8d 4c 24 ?? e8 | ?? ?? ?? ?? 83 7c 24 ?? 00 48 8d"];
 
     BinaryMatcher::patterns(patterns)?
-        .with_context()
-        .try_map_each(|(ctx, address)| Ok(ctx.image().memory.rip4(address)?))
-        .try_map(ensure_one)
+        .rip4()
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
@@ -330,12 +317,7 @@ impl_resolver_singleton!(all, FNameToStringFString, |ctx| async {
 /// this is the address of the static pointer to
 /// `TStaticIndirectArrayThreadSafeRead<FNameEntry>` (i.e. `&GNames`).
 /// Consumers branch on the engine version to interpret the value correctly.
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FNamePool(pub u64);
+pub use super::models::fname::FNamePool;
 impl_resolver_singleton!(all, FNamePool, |ctx| async {
     use futures::join;
     use std::collections::HashSet;
@@ -430,23 +412,14 @@ impl_resolver_singleton!(all, FNamePool, |ctx| async {
 
     // pre-4.23 GNames getter
     let gnames = async {
-        let matches: Vec<u64> = join_all([
-            scan(
-                ctx,
-                Pattern::new("48 83 EC 28 48 8B 05 | ?? ?? ?? ?? 48 85 C0 75 ?? B9 08 04 00 00")
-                    .unwrap(),
-            ),
-            scan(
-                ctx,
-                Pattern::new("48 83 EC 28 48 8B 05 | ?? ?? ?? ?? 48 85 C0 75 ?? B9 08 08 00 00")
-                    .unwrap(),
-            ),
-        ])
+        BinaryMatcher::patterns([
+            "48 83 EC 28 48 8B 05 | ?? ?? ?? ?? 48 85 C0 75 ?? B9 08 04 00 00",
+            "48 83 EC 28 48 8B 05 | ?? ?? ?? ?? 48 85 C0 75 ?? B9 08 08 00 00",
+        ])?
+        .rip4()
+        .ensure_one()
+        .resolve(ctx)
         .await
-        .into_iter()
-        .flatten()
-        .collect();
-        try_ensure_one(matches.into_iter().map(|a| Ok(ctx.image().memory.rip4(a)?)))
     };
 
     let (post_result, gnames_result) = join!(post, gnames);
@@ -454,28 +427,24 @@ impl_resolver_singleton!(all, FNamePool, |ctx| async {
 });
 
 /// StaticFNameConst
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct StaticFNameConst(pub u64);
+pub use super::models::fname::StaticFNameConst;
 impl_resolver_singleton!(all, StaticFNameConst, |ctx| async {
-    let strings = util::string_pattern(ctx, "GLSL_ES3_1_ANDROID\0").await;
-    let str_addr = ensure_one(strings)?;
-    let refs = join_all(
-        [
+    BinaryMatcher::patterns([
+        util::utf16_pattern("GLSL_ES3_1_ANDROID\0"),
+        util::utf8_pattern("GLSL_ES3_1_ANDROID\0"),
+    ])?
+    .ensure_one()
+    .try_flat_map(|str_addr| {
+        BinaryMatcher::patterns([
             // pre-5.7 FName(.., FNAME_Add)
             format!("41 b8 01 00 00 00 48 8d 15 X0x{str_addr:08x} 48 8d 0d | ?? ?? ?? ?? e9"),
             // 5.7+ FName(..)
             format!("48 8d 15 X0x{str_addr:08x} 48 8d 0d | ?? ?? ?? ?? e9"),
-        ]
-        .map(|p| scan(ctx, Pattern::new(p).unwrap())),
-    )
+        ])
+    })
+    .first()
+    .rip4()
+    .map(Self)
+    .resolve(ctx)
     .await
-    .concat();
-    match refs.len() {
-        0 => Err(ResolveError::new_msg("expected at least one value")),
-        _ => Ok(StaticFNameConst(ctx.image().memory.rip4(refs[0])?)),
-    }
 });

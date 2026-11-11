@@ -1,7 +1,5 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/gmalloc.rs>
 
-use std::fmt::Debug;
-
 use super::scan::scan;
 use binary_bloodhound::BinaryMatcher;
 use futures::join;
@@ -10,17 +8,11 @@ use itertools::Itertools;
 
 use super::util;
 use patternsleuth::{
-    MemoryTrait,
     disassemble::{Control, disassemble},
-    resolvers::{Result, ensure_one, impl_resolver_singleton, try_ensure_one},
+    resolvers::{Result, impl_resolver_singleton, try_ensure_one},
 };
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct GMalloc(pub u64);
+pub use super::models::memory::GMalloc;
 impl_resolver_singleton!(all, GMalloc, |ctx| async {
     let (patterns, strings) = join!(
         ctx.resolve(GMallocPatterns::resolver()),
@@ -29,12 +21,7 @@ impl_resolver_singleton!(all, GMalloc, |ctx| async {
     Ok(Self(patterns.map(|r| r.0).or(strings.map(|r| r.0))?))
 });
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct GMallocPatterns(pub u64);
+pub use super::models::memory::GMallocPatterns;
 impl_resolver_singleton!(all, GMallocPatterns, |ctx| async {
     let patterns = [
         "48 ?? ?? f0 ?? 0f b1 ?? | ?? ?? ?? ?? 74 ?? ?? 85 ?? 74 ?? ?? 8b", // Purgatory
@@ -54,20 +41,14 @@ impl_resolver_singleton!(all, GMallocPatterns, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .with_context()
-        .try_map_each(|(ctx, address)| Ok(ctx.image().memory.rip4(address)?))
-        .try_map(ensure_one)
+        .rip4()
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
 });
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct GMallocString(pub u64);
+pub use super::models::memory::GMallocString;
 impl_resolver_singleton!(collect, GMallocString);
 
 impl_resolver_singleton!(PEImage, GMallocString, |ctx| async {

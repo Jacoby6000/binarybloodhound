@@ -4,18 +4,10 @@ use binary_bloodhound::BinaryMatcher;
 use futures::join;
 
 use super::util;
-use patternsleuth::{
-    MemoryTrait,
-    resolvers::{ensure_one, impl_resolver_singleton},
-};
+use patternsleuth::resolvers::{ensure_one, impl_resolver_singleton};
 
 /// class UObject * __cdecl StaticLoadObject(class UClass *, class UObject *, wchar_t const *, wchar_t const *, unsigned int, class UPackageMap *, bool, struct FLinkerInstancingContext const *)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct StaticLoadObject(pub u64);
+pub use super::models::objects::StaticLoadObject;
 impl_resolver_singleton!(all, StaticLoadObject, |ctx| async {
     let any = join!(
         ctx.resolve(StaticLoadObjectPatterns::resolver()),
@@ -29,12 +21,7 @@ impl_resolver_singleton!(all, StaticLoadObject, |ctx| async {
     )?))
 });
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct StaticLoadObjectPatterns(pub u64);
+pub use super::models::objects::StaticLoadObjectPatterns;
 impl_resolver_singleton!(all, StaticLoadObjectPatterns, |ctx| async {
     let patterns = [
         "c6 44 24 30 01 48 8b d5 4c 89 54 24 28 48 8b c8 89 5c 24 20 e8 | ?? ?? ?? ?? 48 8b 5c 24 50 48 8b 6c 24 58 48 8b 74 24 60 48 83 c4 40 5f c3",
@@ -42,20 +29,14 @@ impl_resolver_singleton!(all, StaticLoadObjectPatterns, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .with_context()
-        .try_map_each(|(ctx, address)| Ok(ctx.image().memory.rip4(address)?))
-        .try_map(ensure_one)
+        .rip4()
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
 });
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct StaticLoadObjectString(pub u64);
+pub use super::models::objects::StaticLoadObjectString;
 impl_resolver_singleton!(all, StaticLoadObjectString, |ctx| async {
     BinaryMatcher::patterns(
         [
@@ -67,7 +48,7 @@ impl_resolver_singleton!(all, StaticLoadObjectString, |ctx| async {
     .references()
     .root_functions()
     .addresses()
-    .try_map(ensure_one)
+    .ensure_one()
     .map(Self)
     .resolve(ctx)
     .await

@@ -1,7 +1,6 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/blueprint_library.rs>
 
-use std::{fmt::Debug, str::FromStr};
-
+use binary_bloodhound::BinaryMatcher;
 use futures::{future::join_all, join};
 
 use super::scan::{scan, scan_tagged};
@@ -10,28 +9,10 @@ use patternsleuth::scanner::Pattern;
 
 use patternsleuth::{
     Addressable,
-    resolvers::{Context, ResolveError, ensure_one, impl_resolver, impl_resolver_singleton},
+    resolvers::{Context, ensure_one, impl_resolver, impl_resolver_singleton},
 };
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct BlueprintLibraryInit {
-    pub uclass_compiled_in_defer: u64,
-    pub uobject_compiled_in_defer: u64,
-    pub construct_uclass: u64,
-    pub get_private_static_class_body: u64,
-    pub uobject_static_class: u64,
-    pub ublueprint_function_library_static_class: u64,
-}
-impl FromStr for BlueprintLibraryInit {
-    type Err = ResolveError;
-    fn from_str(_s: &str) -> std::result::Result<Self, Self::Err> {
-        Err(ResolveError::new_msg("unimplemented"))
-    }
-}
+pub use super::models::blueprint::BlueprintLibraryInit;
 
 impl_resolver!(all, BlueprintLibraryInit, |ctx| async {
     let mem = &ctx.image().memory;
@@ -174,15 +155,9 @@ impl_resolver!(all, BlueprintLibraryInit, |ctx| async {
 });
 
 /// UFunction::Bind
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct UFunctionBind(pub u64);
+pub use super::models::blueprint::UFunctionBind;
 impl_resolver_singleton!(collect, UFunctionBind);
 impl_resolver_singleton!(PEImage, UFunctionBind, |ctx| async {
-    use binary_bloodhound::BinaryMatcher;
     let string = BinaryMatcher::pattern(util::utf16_pattern(
         "Failed to bind native function %s.%s\0",
     ))
@@ -199,7 +174,11 @@ impl_resolver_singleton!(PEImage, UFunctionBind, |ctx| async {
 
 impl_resolver_singleton!(ElfImage, UFunctionBind, |ctx| async {
     // maybe find symbol of vtable?
-    let pattern = Pattern::new("41 56 53 50 49 89 fe 48 89 fb 66 0f 1f 44 00 00 e8 ?? ?? ?? ?? 48 8b 4b 10 48 63 50 38 3b 51 38 7e ?? 31 c0 48 8b 5b 20 48 85 db 75 ?? eb ?? 90 48 83 c0 30").unwrap();
-    let fns = scan(ctx, pattern).await;
-    Ok(Self(ensure_one(fns)?))
+    BinaryMatcher::patterns([
+        "41 56 53 50 49 89 fe 48 89 fb 66 0f 1f 44 00 00 e8 ?? ?? ?? ?? 48 8b 4b 10 48 63 50 38 3b 51 38 7e ?? 31 c0 48 8b 5b 20 48 85 db 75 ?? eb ?? 90 48 83 c0 30",
+    ])?
+        .ensure_one()
+        .map(Self)
+        .resolve(ctx)
+        .await
 });

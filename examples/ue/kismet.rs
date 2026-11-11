@@ -1,7 +1,5 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/kismet.rs>
 
-use std::{fmt::Debug, str::FromStr};
-
 use super::scan::scan_tagged;
 use binary_bloodhound::BinaryMatcher;
 use futures::future::join_all;
@@ -11,18 +9,12 @@ use patternsleuth::scanner::Pattern;
 use patternsleuth::{
     Addressable, MemoryTrait,
     resolvers::{
-        ResolveError, Result, bail_out, ensure_one, impl_resolver, impl_resolver_singleton,
-        try_ensure_one,
+        Result, bail_out, ensure_one, impl_resolver, impl_resolver_singleton, try_ensure_one,
     },
 };
 
 /// public: void __cdecl UObject::SkipFunction(struct FFrame &, void *const, class UFunction *)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct UObjectSkipFunction(pub u64);
+pub use super::models::kismet::UObjectSkipFunction;
 impl_resolver_singleton!(all, UObjectSkipFunction, |ctx| async {
     let patterns = [
         "40 55 41 54 41 55 41 56 41 57 48 83 EC 30 48 8D 6C 24 20 48 89 5D 40 48 89 75 48 48 89 7D 50 48 8B 05 ?? ?? ?? ?? 48 33 C5 48 89 45 00 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 4D 8B ?? ?? 8B ?? 85 ?? 75 05 41 8B FC EB ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 48 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 48 ?? E0",
@@ -33,19 +25,14 @@ impl_resolver_singleton!(all, UObjectSkipFunction, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .try_map(ensure_one)
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
 });
 
 // GNatives
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct GNatives(pub u64);
+pub use super::models::kismet::GNatives;
 impl_resolver_singleton!(collect, GNatives);
 
 impl_resolver_singleton!(PEImage, GNatives, |ctx| async {
@@ -74,12 +61,7 @@ impl_resolver_singleton!(ElfImage, GNatives, |ctx| async {
         .map(|r| Self(r.0))
 });
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct GNativesPatterns(pub u64);
+pub use super::models::kismet::GNativesPatterns;
 impl_resolver_singleton!(collect, GNativesPatterns);
 
 impl_resolver_singleton!(PEImage, GNativesPatterns, |ctx| async {
@@ -88,9 +70,8 @@ impl_resolver_singleton!(PEImage, GNativesPatterns, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .with_context()
-        .try_map_each(|(ctx, address)| Ok(ctx.image().memory.rip4(address)?))
-        .try_map(ensure_one)
+        .rip4()
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
@@ -101,12 +82,7 @@ impl_resolver_singleton!(ElfImage, GNativesPatterns, |_ctx| async {
 });
 
 // Skip-function-based resolver
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct GNativesViaSkipFunction(pub u64);
+pub use super::models::kismet::GNativesViaSkipFunction;
 impl_resolver_singleton!(collect, GNativesViaSkipFunction);
 
 impl_resolver_singleton!(PEImage, GNativesViaSkipFunction, |ctx| async {
@@ -157,12 +133,7 @@ impl_resolver_singleton!(ElfImage, GNativesViaSkipFunction, |ctx| async {
 });
 
 // FFrame::Step-based resolver
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct GNativesViaFFrameStep(pub u64);
+pub use super::models::kismet::GNativesViaFFrameStep;
 impl_resolver_singleton!(collect, GNativesViaFFrameStep);
 
 impl_resolver_singleton!(PEImage, GNativesViaFFrameStep, |ctx| async {
@@ -194,12 +165,7 @@ impl_resolver_singleton!(ElfImage, GNativesViaFFrameStep, |_ctx| async {
 });
 
 /// public: void __cdecl FFrame::Step(class UObject *, void *const)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FFrameStep(pub u64);
+pub use super::models::kismet::FFrameStep;
 impl_resolver_singleton!(all, FFrameStep, |ctx| async {
     let patterns = [
         "48 8B 41 20 4C 8B D2 48 8B D1 44 0F B6 08 48 FF C0 48 89 41 20 41 8B C1 4C 8D 0D ?? ?? ?? ?? 49 8B CA 49 FF 24 C1",
@@ -208,7 +174,7 @@ impl_resolver_singleton!(all, FFrameStep, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .try_map(ensure_one)
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
@@ -216,12 +182,7 @@ impl_resolver_singleton!(all, FFrameStep, |ctx| async {
 
 /// public: void __cdecl FFrame::StepExplicitProperty(void *const, class FProperty *)
 /// public: void __cdecl FFrame::StepExplicitProperty(void *const, class UProperty *)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FFrameStepExplicitProperty(pub u64);
+pub use super::models::kismet::FFrameStepExplicitProperty;
 impl_resolver_singleton!(all, FFrameStepExplicitProperty, |ctx| async {
     let patterns = [
         "41 8B 40 40 4D 8B C8 4C 8B D1 48 0F BA E0 08 73 ?? 48 8B ?? ?? ?? ?? 00 ?? ?? ?? ?? ?? ?? ?? 00 48 8B 40 10 4C 39 08 75 F7 48 8B 48 08 49 89 4A 38 ?? ?? ?? 40 ?? ?? ?? ?? ?? 4C ?? 41 ?? 49",
@@ -231,7 +192,7 @@ impl_resolver_singleton!(all, FFrameStepExplicitProperty, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .try_map(ensure_one)
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
@@ -239,21 +200,7 @@ impl_resolver_singleton!(all, FFrameStepExplicitProperty, |ctx| async {
 
 /// public: static void __cdecl UKismetStringLibrary::execLen(class UObject *, struct FFrame &, void *const)
 /// public: void __cdecl UKismetStringLibrary::execLen(struct FFrame &, void *const)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FFrameStepViaExec {
-    pub step: u64,
-    pub step_explicit_property: u64,
-}
-impl FromStr for FFrameStepViaExec {
-    type Err = ResolveError;
-    fn from_str(_s: &str) -> std::result::Result<Self, Self::Err> {
-        Err(ResolveError::new_msg("unimplemented"))
-    }
-}
+pub use super::models::kismet::FFrameStepViaExec;
 impl_resolver!(all, FFrameStepViaExec, |ctx| async {
     let patterns = [
         "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC ?? 33 FF 33 C0 49 8B F0 48 8B DA 48 8B CA 48 89 7C 24 20 48 89 7C 24 28 48 39 42 20 74 10 48 8B 52 18 4C 8D 44 24 20 E8 [ ?? ?? ?? ?? ] EB 1C 4C 8B 82 80 00 00 00 49 8B 40 ?? 48 89 82 80 00 00 00 48 8D 54 24 20 E8 [ ?? ?? ?? ?? ] 48 8B 43 20 48 8D 4C 24 20 48 85 C0",

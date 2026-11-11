@@ -12,6 +12,7 @@ pub mod gengine;
 pub mod gmalloc;
 pub mod guobject_array;
 pub mod kismet;
+pub mod models;
 pub mod pak;
 pub mod save_game;
 mod scan;
@@ -25,14 +26,9 @@ pub mod util;
 mod tests;
 
 use binary_bloodhound::BinaryMatcher;
-use patternsleuth::resolvers::{DynResolverFactory, ensure_one, impl_resolver_singleton};
+use patternsleuth::resolvers::{DynResolverFactory, impl_resolver_singleton};
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct ConsoleManagerSingleton(pub u64);
+pub use models::engine::ConsoleManagerSingleton;
 impl_resolver_singleton!(all, ConsoleManagerSingleton, |ctx| async {
     let strings = BinaryMatcher::patterns([
         util::utf16_pattern("r.DumpingMovie"),
@@ -46,22 +42,17 @@ impl_resolver_singleton!(all, ConsoleManagerSingleton, |ctx| async {
     let address = BinaryMatcher::patterns(patterns)?
         .root_functions()
         .addresses()
-        .try_map(ensure_one)
+        .ensure_one()
         .resolve(ctx)
         .await?;
     Ok(Self(address))
 });
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct UObjectBaseUtilityGetPathName(pub u64);
+pub use models::objects::UObjectBaseUtilityGetPathName;
 impl_resolver_singleton!(all, UObjectBaseUtilityGetPathName, |ctx| async {
     let address = BinaryMatcher::patterns([
         "40 53 48 81 EC 50 02 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 ?? ?? ?? ?? 48 8D 44 24",
-    ])?.try_map(ensure_one).resolve(ctx).await?;
+    ])?.ensure_one().resolve(ctx).await?;
     Ok(Self(address))
 });
 

@@ -1,18 +1,11 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/save_game.rs>
 
-use std::fmt::Debug;
-
 use binary_bloodhound::BinaryMatcher;
 
-use patternsleuth::resolvers::{ensure_one, impl_resolver_singleton};
+use patternsleuth::resolvers::impl_resolver_singleton;
 
 /// public: static bool __cdecl UGameplayStatics::SaveGameToMemory(class USaveGame *, class TArray<unsigned char, class TSizedDefaultAllocator<32> > &)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct UGameplayStaticsSaveGameToMemory(pub u64);
+pub use super::models::save_game::UGameplayStaticsSaveGameToMemory;
 impl_resolver_singleton!(all, UGameplayStaticsSaveGameToMemory, |ctx| async {
     let patterns = [
         "48 89 5C 24 10 48 89 7C 24 18 55 48 8D AC 24 ?? FF FF FF 48 81 EC ?? 01 00 00 48 8B DA 48 8B F9 48 85 C9 0F 84 ?? 02 00 00 0F 57 C0 48 C7 85 ?? 00 00 00 00 00 00 00",
@@ -23,19 +16,14 @@ impl_resolver_singleton!(all, UGameplayStaticsSaveGameToMemory, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .try_map(ensure_one)
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
 });
 
 /// public: static bool __cdecl UGameplayStatics::SaveGameToSlot(class USaveGame *, class FString const &, int)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct UGameplayStaticsSaveGameToSlot(pub u64);
+pub use super::models::save_game::UGameplayStaticsSaveGameToSlot;
 impl_resolver_singleton!(all, UGameplayStaticsSaveGameToSlot, |ctx| async {
     let patterns = [
         "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 40 ?? 8B ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? E8 ?? ?? FF FF 84 C0 74 58 E8 ?? ?? ?? ?? 48 8B ?? 48 8B ?? FF 52 ?? 4C 8B D0 48 85 C0 74 42 39 74 24 38 7E 3C 8B 53 08 ?? ?? ?? ?? ?? 0F 44 CE 85 C9 7E 2D",
@@ -46,19 +34,14 @@ impl_resolver_singleton!(all, UGameplayStaticsSaveGameToSlot, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .try_map(ensure_one)
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
 });
 
 /// public: static class USaveGame * __cdecl UGameplayStatics::LoadGameFromMemory(class TArray<unsigned char, class TSizedDefaultAllocator<32> > const &)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct UGameplayStaticsLoadGameFromMemory(pub u64);
+pub use super::models::save_game::UGameplayStaticsLoadGameFromMemory;
 impl_resolver_singleton!(all, UGameplayStaticsLoadGameFromMemory, |ctx| async {
     let patterns = [
         "48 89 5C 24 20 55 48 8D AC 24 10 FF FF FF 48 81 EC F0 01 00 00 83 79 08 00 48 8B D9 75 13 33 C0 48 8B 9C 24 18 02 00 00 48 81 C4 F0 01 00 00 5D C3 0F 57 C0 48 89 ?? 24 ?? 02 00 00 48 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 0F 11 45 ?? 0F 11 45 ?? 0F 11 45 ?? 0F 11 45 ?? 0F 11 45 ?? 0F 11 45 ?? 0F 11",
@@ -71,19 +54,14 @@ impl_resolver_singleton!(all, UGameplayStaticsLoadGameFromMemory, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .try_map(ensure_one)
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
 });
 
 /// public: static class USaveGame * __cdecl UGameplayStatics::LoadGameFromSlot(class FString const &, int)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct UGameplayStaticsLoadGameFromSlot(pub u64);
+pub use super::models::save_game::UGameplayStaticsLoadGameFromSlot;
 impl_resolver_singleton!(all, UGameplayStaticsLoadGameFromSlot, |ctx| async {
     let patterns = [
         "48 8B C4 55 ?? 48 8D A8 ?? FE FF FF 48 81 EC ?? 02 00 00 48 89 ?? 08 33 ?? 48 89 ?? 10 48 8B ?? 4C 89 70 E8 44 8B F2 48 89 ?? 24 40 48 89 ?? 24 48 E8 ?? ?? ?? ?? 48 8B C8 4C 8B 00 41 FF 50 40 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 48 8D 35",
@@ -96,7 +74,7 @@ impl_resolver_singleton!(all, UGameplayStaticsLoadGameFromSlot, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .try_map(ensure_one)
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
@@ -104,12 +82,7 @@ impl_resolver_singleton!(all, UGameplayStaticsLoadGameFromSlot, |ctx| async {
 
 // not exists on linux
 /// public: static bool __cdecl UGameplayStatics::DoesSaveGameExist(class FString const &, int)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct UGameplayStaticsDoesSaveGameExist(pub u64);
+pub use super::models::save_game::UGameplayStaticsDoesSaveGameExist;
 impl_resolver_singleton!(all, UGameplayStaticsDoesSaveGameExist, |ctx| async {
     let patterns = [
         "48 89 5C 24 08 57 48 83 EC 20 8B FA 48 8B D9 E8 ?? ?? ?? ?? 48 8B C8 4C 8B 00 41 FF 50 ?? 48 85 C0 74 3D 83 7B 08 00 4C 8B 00 4D 8B 48 ?? 74 16 48 8B 13 44 8B C7 48 8B C8 48 8B 5C 24 30 48 83 C4 20 5F 49 FF E1 48 8D 15 ?? ?? ?? ?? 44 8B C7 48 8B C8 48 8B 5C 24 30 48 83 C4 20 5F 49 FF E1 48 8B 5C 24",
@@ -118,7 +91,7 @@ impl_resolver_singleton!(all, UGameplayStaticsDoesSaveGameExist, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .try_map(ensure_one)
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await

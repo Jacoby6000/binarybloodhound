@@ -1,21 +1,11 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/fuobject_hash_tables.rs>
 
-use std::fmt::Debug;
-
 use binary_bloodhound::BinaryMatcher;
 
-use patternsleuth::{
-    MemoryTrait,
-    resolvers::{ensure_one, impl_resolver_singleton},
-};
+use patternsleuth::resolvers::impl_resolver_singleton;
 
 /// public: static class FUObjectHashTables & __cdecl FUObjectHashTables::Get(void)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct FUObjectHashTablesGet(pub u64);
+pub use super::models::objects::FUObjectHashTablesGet;
 // try find u16"Hash efficiency statistics for the Outer Object Hash"
 // LogHashOuterStatistics(FOutputDevice& Ar, const bool bShowHashBucketCollisionInfo)
 // FHashTableLock HashLock(FUObjectHashTables::Get());
@@ -32,9 +22,8 @@ impl_resolver_singleton!(all, FUObjectHashTablesGet, |ctx| async {
         "0f 84 ?? ?? ?? ?? e8 | ?? ?? ?? ?? 84 c0 74 18 e8 ?? ?? ?? ?? 84 c0 74 0f b0 01 89 44 24 0c 31 c0 48 89 44 24 10 eb",
     ];
     BinaryMatcher::patterns(patterns)?
-        .with_context()
-        .try_map_each(|(ctx, address)| Ok(ctx.image().memory.rip4(address)?))
-        .try_map(ensure_one)
+        .rip4()
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await

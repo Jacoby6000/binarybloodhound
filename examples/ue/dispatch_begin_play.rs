@@ -2,18 +2,10 @@
 
 use binary_bloodhound::BinaryMatcher;
 
-use patternsleuth::{
-    MemoryTrait,
-    resolvers::{ensure_one, impl_resolver_singleton},
-};
+use patternsleuth::resolvers::impl_resolver_singleton;
 
 /// void AActor::DispatchBeginPlay(...)
-#[derive(Debug, PartialEq)]
-#[cfg_attr(
-    feature = "serde-resolvers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
-pub struct AActorDispatchBeginPlay(pub u64);
+pub use super::models::actor::AActorDispatchBeginPlay;
 impl_resolver_singleton!(all, AActorDispatchBeginPlay, |ctx| async {
     let patterns = [
         "48 8B 0B B2 01 E8 | ?? ?? ?? ?? 48 8D 5B 08 48",
@@ -25,9 +17,8 @@ impl_resolver_singleton!(all, AActorDispatchBeginPlay, |ctx| async {
     ];
 
     BinaryMatcher::patterns(patterns)?
-        .with_context()
-        .try_map_each(|(ctx, address)| Ok(ctx.image().memory.rip4(address)?))
-        .try_map(ensure_one)
+        .rip4()
+        .ensure_one()
         .map(Self)
         .resolve(ctx)
         .await
