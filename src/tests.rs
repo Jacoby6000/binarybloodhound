@@ -1,4 +1,8 @@
 use super::*;
+use patternsleuth::{
+    resolvers::{ResolveError, Result},
+    scanner::Pattern,
+};
 
 const BASE: u64 = 0x1_4000_0000;
 const TEXT: u64 = BASE + 0x1000;
@@ -23,13 +27,14 @@ mod pe {
     #[test]
     fn function_traversal_propagates_unwind_memory_errors() {
         let image = call_graph().without_section(".xdata");
-        let wrappers: [for<'a> fn(BinaryMatcher<'a>) -> BinaryMatcher<'a>; 3] = [
-            |matcher: BinaryMatcher| matcher.root_functions().addresses(),
-            |matcher: BinaryMatcher| matcher.callees().addresses(),
-            |matcher: BinaryMatcher| matcher.call_sites().addresses(),
-        ];
-        for wrap in wrappers {
-            let error = run(&image, wrap(BinaryMatcher::address(SHARED_CALLER))).unwrap_err();
+        for operation in 0..3 {
+            let matcher = BinaryMatcher::address(SHARED_CALLER);
+            let result = match operation {
+                0 => run(&image, matcher.root_functions()),
+                1 => run(&image, matcher.callees()),
+                _ => run(&image, matcher.call_sites()),
+            };
+            let error = result.unwrap_err();
 
             assert_eq!(
                 error.to_string(),

@@ -111,9 +111,9 @@ impl_resolver_singleton!(PEImage, FNameCtorWchar, |ctx| async {
     if !ctor.is_empty() {
         return BinaryMatcher::candidates(ctor)
             .ensure_one()
-            .map(Self)
             .resolve(ctx)
-            .await;
+            .await
+            .map(|node| Self(*node.value));
     }
 
     // sometimes the call gets inlined so use patterns if any match
@@ -121,9 +121,9 @@ impl_resolver_singleton!(PEImage, FNameCtorWchar, |ctx| async {
         return BinaryMatcher::candidates(patterns)
             .rip4()
             .ensure_one()
-            .map(Self)
             .resolve(ctx)
-            .await;
+            .await
+            .map(|node| Self(*node.value));
     }
 
     #[derive(Clone, Copy)]
@@ -191,15 +191,16 @@ impl_resolver_singleton!(ElfImage, FNameToString, |ctx| async {
     BinaryMatcher::patterns([util::utf16_pattern("SkySphereMesh\0")])?
         .ensure_one()
         .try_flat_map(|str_addr| {
+            let str_addr = *str_addr.value;
             BinaryMatcher::patterns([format!(
                 "e8 | ?? ?? ?? ?? 49 8b 5f 10 48 8d 7c 24 30 be 0x{str_addr:08x}"
             )])
         })
         .rip4()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 impl_resolver_singleton!(PEImage, FNameToString, |ctx| async {
@@ -292,9 +293,9 @@ impl_resolver_singleton!(all, FNameToStringVoid, |ctx| async {
     BinaryMatcher::patterns(patterns)?
         .rip4()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 /// public: void __cdecl FName::ToString(class FString &) const
@@ -306,9 +307,9 @@ impl_resolver_singleton!(all, FNameToStringFString, |ctx| async {
     BinaryMatcher::patterns(patterns)?
         .rip4()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 /// FNamePool: resolved address of the global FName storage.
@@ -420,6 +421,7 @@ impl_resolver_singleton!(all, FNamePool, |ctx| async {
         .ensure_one()
         .resolve(ctx)
         .await
+        .map(|node| *node.value)
     };
 
     let (post_result, gnames_result) = join!(post, gnames);
@@ -435,6 +437,7 @@ impl_resolver_singleton!(all, StaticFNameConst, |ctx| async {
     ])?
     .ensure_one()
     .try_flat_map(|str_addr| {
+        let str_addr = *str_addr.value;
         BinaryMatcher::patterns([
             // pre-5.7 FName(.., FNAME_Add)
             format!("41 b8 01 00 00 00 48 8d 15 X0x{str_addr:08x} 48 8d 0d | ?? ?? ?? ?? e9"),
@@ -444,7 +447,7 @@ impl_resolver_singleton!(all, StaticFNameConst, |ctx| async {
     })
     .first()
     .rip4()
-    .map(Self)
     .resolve(ctx)
     .await
+    .map(|node| Self(*node.value))
 });

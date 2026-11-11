@@ -113,7 +113,7 @@ fn walk_disassembly_exit_retains_returns_and_skips_queued_paths() {
 fn walk_disassembly_discards_state_on_implicit_path_end() {
     let mut text = vec![0x90; 256];
     text[0] = 0xc3;
-    let matcher: Matcher<(), u64> = BinaryMatcher::address(TEXT)
+    let matcher: Matcher<(), u64, Variable, _> = BinaryMatcher::address(TEXT)
         .root_functions()
         .walk_disassembly(|_| 7, |state, _| Ok(Control::Continue(state + 1)));
     let result = run_stage(&image(text), matcher, ()).unwrap();
@@ -297,7 +297,7 @@ fn walk_disassembly_returns_can_be_non_clone_and_capture_borrowed_data() {
     let text = String::from("borrowed");
     let matcher = functions(&[(TEXT, TEXT + 1)])
         .walk_disassembly(|_| (), |(), _| Ok(Control::Return(Output(text.clone()))));
-    let result = run_stage(&image(vec![0xc3]), matcher, ()).unwrap();
+    let result = run_nodes(&image(vec![0xc3]), matcher, ()).unwrap();
 
     assert_eq!(result[0].0, "borrowed");
 }
@@ -462,7 +462,7 @@ fn walk_disassembly_adapter_skips_empty_resolved_ranges() {
 #[test]
 fn walk_disassembly_initializes_from_original_addresses_but_starts_at_their_roots() {
     let matcher = BinaryMatcher::candidates([TEXT + 8, TEXT + 24, TEXT + 8]).walk_disassembly(
-        |address| address,
+        |address| *address.value,
         |address, instruction| Ok(Control::Return((address, instruction.ip()))),
     );
     let result = run_stage(&image(vec![0x90; 256]), matcher, ()).unwrap();
@@ -491,7 +491,7 @@ fn walk_disassembly_supports_non_clone_custom_address_candidates() {
         }])
     })
     .walk_disassembly(
-        |source| (source.address, source.label),
+        |source| (source.address, source.label.clone()),
         |state, instruction| Ok(Control::Return((state, instruction.ip()))),
     );
     let result = run_stage(&image(vec![0x90; 256]), matcher, ()).unwrap();
@@ -513,7 +513,7 @@ fn walk_disassembly_unknown_roots_do_not_call_the_initializer() {
 #[test]
 fn walk_disassembly_stage_accepts_raw_address_candidates() {
     let matcher = BinaryMatcher::address(TEXT + 8).then(stages::walk_disassembly(
-        |address: u64| address,
+        |address: &Trace<u64>| *address.value,
         |address, instruction| Ok(Control::Return((address, instruction.ip()))),
     ));
     let result = run_stage(&image(vec![0x90; 256]), matcher, ()).unwrap();
@@ -524,7 +524,7 @@ fn walk_disassembly_stage_accepts_raw_address_candidates() {
 #[test]
 fn walk_disassembly_reusable_stage_and_repeated_evaluations_start_fresh() {
     let matcher = functions(&[(TEXT, TEXT + 1)]).then(stages::walk_disassembly(
-        |function: FunctionEntry| function.start,
+        |function: &Trace<FunctionEntry>| function.start,
         |count, _| Ok(Control::Return(count + 1)),
     ));
     let image = image(vec![0xc3]);

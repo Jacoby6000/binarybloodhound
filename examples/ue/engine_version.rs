@@ -370,9 +370,9 @@ impl_resolver_singleton!(all, CustomVersionRegistry, |ctx| async {
     BinaryMatcher::patterns(patterns)?
         .rip4()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 pub use super::models::custom_versions::StaticCustomVersions;
@@ -578,6 +578,7 @@ impl_resolver!(all, InternalProjectName, |ctx| async {
         .ensure_one()
         .resolve(ctx)
         .await?;
+    let internal_project_name = *internal_project_name.value;
     let is_bss_section = ctx
         .image()
         .memory

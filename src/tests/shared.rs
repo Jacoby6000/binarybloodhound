@@ -1,4 +1,6 @@
 use super::*;
+use iced_x86::FlowControl;
+include!("provenance.rs");
 include!("walk_disassembly.rs");
 use object::SectionKind;
 use patternsleuth::{
@@ -6,6 +8,8 @@ use patternsleuth::{
     image::Image,
     resolvers::{Context as _, bail_out, eval},
 };
+
+type AddressRead = for<'a> fn(BinaryMatcher<'a>) -> Matcher<'a, (), u64, Variable, Trace<u64>>;
 
 fn section(
     name: &str,
@@ -20,12 +24,20 @@ fn image(text: Vec<u8>) -> Image<'static> {
     construct_image(text, 2)
 }
 
-fn run<T: HasAddress + Send, C: Cardinality>(
+fn run<T: HasAddress + Send + Sync, P: Send + Sync, C: Cardinality>(
     image: &Image<'_>,
-    matcher: Matcher<'_, (), T, C>,
+    matcher: Matcher<'_, (), T, C, P>,
 ) -> Result<Vec<u64>> {
     eval(image, move |ctx| {
-        Box::pin(async move { matcher.into_variable().addresses().resolve(ctx).await })
+        Box::pin(async move {
+            Ok(matcher
+                .into_variable()
+                .resolve(ctx)
+                .await?
+                .iter()
+                .map(HasAddress::address)
+                .collect())
+        })
     })
 }
 
@@ -33,18 +45,43 @@ fn patterns<'scope>(values: &[&str]) -> BinaryMatcher<'scope> {
     BinaryMatcher::patterns(values).unwrap()
 }
 
-fn run_stage<'scope, I, O, C: Cardinality>(
+fn run_nodes<'scope, I, O, P, C: Cardinality>(
     image: &Image<'_>,
-    matcher: Matcher<'scope, I, O, C>,
+    matcher: Matcher<'scope, I, O, C, P>,
+    input: I,
+) -> Result<C::Output<Trace<O, P>>>
+where
+    I: Send + Sync,
+    O: Send + Sync,
+    P: Send + Sync,
+    C::Output<Trace<O, P>>: Sync,
+{
+    eval(image, move |ctx| {
+        Box::pin(async move { matcher.run(input, ctx).await })
+    })
+}
+
+fn run_stage<'scope, I, O, P, C: Cardinality>(
+    image: &Image<'_>,
+    matcher: Matcher<'scope, I, O, C, P>,
     input: I,
 ) -> Result<C::Output<O>>
 where
     I: Send + Sync,
-    O: Send + Sync,
+    O: Clone + Send + Sync,
+    P: Send + Sync,
     C::Output<O>: Sync,
 {
     eval(image, move |ctx| {
-        Box::pin(async move { matcher.run(input, ctx).await })
+        Box::pin(async move {
+            let nodes = matcher.into_variable().run(input, ctx).await?;
+            C::finish(
+                nodes
+                    .into_iter()
+                    .map(|node| node.value.as_ref().clone())
+                    .collect(),
+            )
+        })
     })
 }
 
@@ -108,7 +145,7 @@ fn address_reads_deref_chains_without_validating_the_final_destination() {
 #[test]
 fn address_reads_propagate_truncated_and_unmapped_memory_errors() {
     let image = image(vec![0; 8]);
-    let operations: [for<'a> fn(BinaryMatcher<'a>) -> BinaryMatcher<'a>; 3] = [
+    let operations: [AddressRead; 3] = [
         |matcher| matcher.rip4(),
         |matcher| matcher.read_u64(),
         |matcher| matcher.deref(),
@@ -128,7 +165,7 @@ fn address_reads_propagate_truncated_and_unmapped_memory_errors() {
 #[test]
 fn address_reads_reject_read_range_overflow_before_accessing_memory() {
     let image = image(vec![]);
-    let operations: [for<'a> fn(BinaryMatcher<'a>) -> BinaryMatcher<'a>; 3] = [
+    let operations: [AddressRead; 3] = [
         |matcher| matcher.rip4(),
         |matcher| matcher.read_u64(),
         |matcher| matcher.deref(),
@@ -184,7 +221,7 @@ fn matchers_compose_directly_with_native_resolver_results() {
 
 #[test]
 fn matcher_callbacks_preserve_native_error_variants_without_conversion() {
-    fn reject(_: Vec<u64>) -> patternsleuth::resolvers::Result<Vec<u64>> {
+    fn reject(_: &[Trace<u64>]) -> patternsleuth::resolvers::Result<Vec<u64>> {
         Err(patternsleuth::MemoryAccessError::MisalginedAddress(TEXT, TEXT + 8).into())
     }
 
@@ -211,8 +248,8 @@ fn new_passes_non_clone_input_and_infers_transformed_output() {
     }
 
     let stage = Matcher::new::<Input>()
-        .transform(|input| input.addresses)
-        .transform(|addresses| addresses.len());
+        .transform(|input| input.addresses.len())
+        .transform(|count| *count.value);
     assert_eq!(
         run_stage(
             &scan_image(),
@@ -240,7 +277,7 @@ fn from_sync_infers_types_and_accepts_borrowed_inputs_outputs_and_captures() {
 
 #[test]
 fn from_sync_preserves_native_errors_and_skips_subsequent_stages() {
-    let stage = Matcher::from_sync(|_: Vec<u64>| -> Result<Vec<u64>> {
+    let stage = Matcher::from_sync(|_: Vec<Trace<u64>>| -> Result<Vec<u64>> {
         Err(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError.into())
     });
     let matcher = BinaryMatcher::address(TEXT)
@@ -274,7 +311,7 @@ fn borrowed_outputs_survive_a_shorter_evaluation_context() {
         })
         .unwrap()
     };
-    assert_eq!(result, text);
+    assert_eq!(*result.value, text);
 }
 
 #[test]
@@ -291,18 +328,18 @@ fn from_async_can_read_image_memory() {
 
 #[test]
 fn fork_passes_the_same_input_to_both_branches() {
-    let left = Matcher::new::<u64>().transform(|value| value + 1);
-    let right = Matcher::new::<u64>().transform(|value| value * 2);
+    let left = Matcher::new::<u64>().transform(|value| *value.value + 1);
+    let right = Matcher::new::<u64>().transform(|value| *value.value * 2);
     let result = run_stage(&scan_image(), left.fork(right), 3).unwrap();
 
-    assert_eq!(result, (4, 6));
+    assert_eq!((*result.0.value, *result.1.value), (4, 6));
 }
 
 #[test]
 fn fork_skips_right_branch_after_left_error() {
-    let left: Matcher<Vec<u64>, u64> =
+    let left: Matcher<Vec<u64>, u64, Variable, _> =
         Matcher::items::<u64>().try_transform_all(|_| Err(ResolveError::new_msg("left failed")));
-    let right: Matcher<Vec<u64>, u64> =
+    let right: Matcher<Vec<u64>, u64, Variable, _> =
         Matcher::items::<u64>().transform_all(|_| panic!("right must not run after left error"));
     let error = run_stage(&scan_image(), left.fork(right), vec![1]).unwrap_err();
 
@@ -312,7 +349,7 @@ fn fork_skips_right_branch_after_left_error() {
 #[test]
 fn fork_propagates_right_branch_errors() {
     let left: Matcher<Vec<u64>, u64> = Matcher::identity();
-    let right: Matcher<Vec<u64>, u64> =
+    let right: Matcher<Vec<u64>, u64, Variable, _> =
         Matcher::items::<u64>().try_transform_all(|_| Err(ResolveError::new_msg("right failed")));
     let error = run_stage(&scan_image(), left.fork(right), vec![1]).unwrap_err();
 
@@ -378,7 +415,7 @@ fn intersect_all_propagates_errors_even_after_an_empty_result() {
 }
 
 #[test]
-fn map_accepts_owned_items() {
+fn map_borrows_items() {
     let matcher = Matcher::items::<String>().map(|word| word.to_uppercase());
     let result = run_stage(&scan_image(), matcher, vec!["foo".into()]).unwrap();
 
@@ -387,7 +424,7 @@ fn map_accepts_owned_items() {
 
 #[test]
 fn map_receives_one_item_and_preserves_order_and_duplicates() {
-    let matcher = Matcher::items::<u64>().map(|address| address + 1);
+    let matcher = Matcher::items::<u64>().map(|address| *address.value + 1);
     let result = run_stage(&scan_image(), matcher, vec![3, 1, 3]).unwrap();
 
     assert_eq!(result, [4, 2, 4]);
@@ -433,7 +470,7 @@ fn candidates_copy_inputs_and_can_be_resolved_repeatedly() {
 #[test]
 fn candidates_compose_with_flat_map_and_selection() {
     let matcher = BinaryMatcher::candidates([3, 1, 3])
-        .flat_map(|address| BinaryMatcher::candidates([address, address + 4]));
+        .flat_map(|address| BinaryMatcher::candidates([*address.value, *address.value + 4]));
     let result = run(&image(vec![]), matcher.clone()).unwrap();
     let selected = run_stage(&image(vec![]), matcher.at_index(-2), ()).unwrap();
 
@@ -486,10 +523,10 @@ fn ensure_one_propagates_upstream_errors() {
 fn map_after_ensure_one_chains_scalar_outputs() {
     let matcher = BinaryMatcher::address(3)
         .ensure_one()
-        .map(|address| address + 1)
+        .map(|address| *address.value + 1)
         .map(|address| address.to_string())
         .map(|text| text.len());
-    let result: usize = eval(&scan_image(), |ctx| Box::pin(matcher.resolve(ctx))).unwrap();
+    let result: usize = run_stage(&scan_image(), matcher, ()).unwrap();
 
     assert_eq!(result, 1);
 }
@@ -498,7 +535,7 @@ fn map_after_ensure_one_chains_scalar_outputs() {
 fn single_map_treats_a_vector_as_one_candidate() {
     let matcher = Matcher::from_sync(|()| Ok(vec![vec![1_u64, 2, 3]]))
         .ensure_one()
-        .map(|values| values.into_iter().rev().collect::<Vec<_>>())
+        .map(|values| values.iter().copied().rev().collect::<Vec<_>>())
         .map(|values| values.len());
     let result = run_stage(&scan_image(), matcher, ()).unwrap();
 
@@ -506,7 +543,7 @@ fn single_map_treats_a_vector_as_one_candidate() {
 }
 
 #[test]
-fn single_map_accepts_owned_non_clone_values_and_borrowed_captures() {
+fn single_map_borrows_non_clone_values_and_captured_data() {
     #[derive(Debug, PartialEq)]
     struct Candidate(String);
     let prefix = String::from("prefix:");
@@ -527,12 +564,12 @@ fn single_context_maps_read_memory_and_return_to_data_only_callbacks() {
         .with_context()
         .map(|(ctx, address)| {
             assert_eq!(ctx.image().base_address, BASE);
-            address
+            *address.value
         })
-        .map(|address| address + 1)
+        .map(|address| *address.value + 1)
         .with_context()
-        .try_map(|(ctx, address)| Ok(ctx.image().memory.u8(address)?))
-        .try_map(|byte| Ok(u64::from(byte)));
+        .try_map(|(ctx, address)| Ok(ctx.image().memory.u8(*address.value)?))
+        .try_map(|byte| Ok(u64::from(*byte.value)));
     let result = run_stage(&scan_image(), matcher, ()).unwrap();
 
     assert_eq!(result, 0xbb);
@@ -573,8 +610,10 @@ fn single_try_map_preserves_native_errors_and_skips_later_callbacks() {
 fn single_matchers_compose_with_scalar_input_stages() {
     let matcher = BinaryMatcher::address(3)
         .ensure_one()
-        .map(|value| value + 1)
-        .then(Matcher::from_sync(|value| Ok(vec![value, value])));
+        .map(|value| *value.value + 1)
+        .then(Matcher::from_sync(|value: Trace<u64, _>| {
+            Ok(vec![*value.value, *value.value])
+        }));
     let result = run(&scan_image(), matcher).unwrap();
 
     assert_eq!(result, [4, 4]);
@@ -586,7 +625,7 @@ fn context_map_can_read_image_memory() {
 
     let matcher = BinaryMatcher::address(TEXT + 8)
         .with_context()
-        .try_map(|(ctx, address)| Ok(ctx.image().memory.u8(address)?));
+        .try_map(|(ctx, address)| Ok(ctx.image().memory.u8(*address.value)?));
     let result = run_stage(&scan_image(), matcher, ()).unwrap();
 
     assert_eq!(result, [0xaa]);
@@ -598,7 +637,7 @@ fn context_combinators_use_each_runs_image_instead_of_capturing_one() {
 
     let matcher = BinaryMatcher::address(TEXT + 8)
         .with_context()
-        .try_map(|(ctx, address)| Ok(ctx.image().memory.u8(address)?));
+        .try_map(|(ctx, address)| Ok(ctx.image().memory.u8(*address.value)?));
     let first = scan_image();
     let second = scan_image();
     let mut text = second.memory.sections()[0].data().to_vec();
@@ -610,7 +649,7 @@ fn context_combinators_use_each_runs_image_instead_of_capturing_one() {
 
 #[test]
 fn context_map_skips_empty_input() {
-    let stage: Matcher<Vec<u64>, u64> = Matcher::identity()
+    let stage: Matcher<Vec<u64>, u64, Variable, _> = Matcher::identity()
         .with_context()
         .try_map(|_| panic!("empty input must skip the callback"));
     let result = run_stage(&scan_image(), stage, vec![]).unwrap();
@@ -626,10 +665,10 @@ fn context_adapter_evaluates_upstream_once() {
     let matcher = BinaryMatcher::address(TEXT + 8)
         .map(|address| {
             *count.lock().unwrap() += 1;
-            address
+            *address.value
         })
         .with_context()
-        .map(|(_, address)| address);
+        .map(|(_, address)| *address.value);
     run(&scan_image(), matcher).unwrap();
 
     assert_eq!(*count.lock().unwrap(), 1);
@@ -643,7 +682,7 @@ fn context_adapter_borrows_non_copy_items_without_requiring_clone() {
     let matcher = Matcher::<Vec<Item>, Item>::identity()
         .with_context()
         .filter_each(|(_, item)| !item.name.is_empty())
-        .map(|item| item.name);
+        .map(|item| item.name.clone());
     let input = ["foo", ""].map(|name| Item { name: name.into() }).into();
     let result = run_stage(&scan_image(), matcher, input).unwrap();
 
@@ -663,14 +702,13 @@ fn context_transform_runs_on_empty_input() {
 
 #[test]
 fn context_adapter_filter_modify_stops_at_first_error_after_none() {
-    let matcher: Matcher<Vec<u64>, u64> =
-        Matcher::items::<u64>()
-            .with_context()
-            .filter_modify(|(_, item)| match item {
-                1 => Ok(None),
-                2 => Err(ResolveError::new_msg("context filter failed")),
-                _ => panic!("must stop after error"),
-            });
+    let matcher: Matcher<Vec<u64>, u64, Variable, _> = Matcher::items::<u64>()
+        .with_context()
+        .filter_modify(|(_, item)| match *item.value {
+            1 => Ok(None),
+            2 => Err(ResolveError::new_msg("context filter failed")),
+            _ => panic!("must stop after error"),
+        });
     let error = run_stage(&scan_image(), matcher, vec![1, 2, 3]).unwrap_err();
 
     assert_eq!(error.to_string(), "context filter failed");
@@ -678,8 +716,8 @@ fn context_adapter_filter_modify_stops_at_first_error_after_none() {
 
 #[test]
 fn try_map_stops_at_the_first_error() {
-    let matcher = Matcher::items::<u64>().try_map(|item| match item {
-        1 => Ok(item),
+    let matcher = Matcher::items::<u64>().try_map(|item| match *item.value {
+        1 => Ok(*item.value),
         2 => Err(ResolveError::new_msg("item failed")),
         _ => panic!("must stop after error"),
     });
@@ -771,7 +809,7 @@ fn patterns_convert_inputs_once_at_construction_not_on_each_resolution() {
     eval(&image, move |ctx| {
         Box::pin(async move {
             for _ in 0..2 {
-                assert_eq!(matcher.resolve(ctx).await.unwrap(), [TEXT + 24]);
+                assert_eq!(*matcher.resolve(ctx).await.unwrap()[0].value, TEXT + 24);
             }
         })
     });
@@ -817,7 +855,7 @@ fn modify_with_chooses_a_different_offset_for_each_match_from_memory() {
     let matcher = patterns(&["AA ?? CC"])
         .with_context()
         .modify_with(|(ctx, address)| {
-            let offset = if ctx.image().memory.u8(address + 1)? == 0xbb {
+            let offset = if ctx.image().memory.u8(*address.value + 1)? == 0xbb {
                 1
             } else {
                 2
@@ -839,7 +877,7 @@ fn modify_with_preserves_callback_order_duplicates_and_absolute_addresses() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&seen);
     let matcher = patterns(&["AA DD CC", "AA BB CC", "AA DD CC"]).modify_with(move |address| {
-        captured.lock().unwrap().push(address);
+        captured.lock().unwrap().push(*address.value);
         // This is an absolute address, not an offset or a memory read.
         Ok(0)
     });
@@ -868,11 +906,11 @@ fn modify_with_stops_at_first_callback_error() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&seen);
     let matcher = patterns(&["AA ?? CC"]).modify_with(move |address| {
-        captured.lock().unwrap().push(address);
-        if address == TEXT + 24 {
+        captured.lock().unwrap().push(*address.value);
+        if *address.value == TEXT + 24 {
             bail_out!("unsupported instruction");
         }
-        Ok(address)
+        Ok(*address.value)
     });
     assert_eq!(
         run(&scan_image(), matcher).unwrap_err().to_string(),
@@ -887,7 +925,7 @@ fn modify_with_propagates_memory_and_checked_arithmetic_errors() {
 
     let unmapped = BinaryMatcher::address(0)
         .with_context()
-        .modify_with(|(ctx, address)| Ok(u64::from(ctx.image().memory.u8(address)?)));
+        .modify_with(|(ctx, address)| Ok(u64::from(ctx.image().memory.u8(*address.value)?)));
     let error = run(&scan_image(), unmapped).unwrap_err();
     assert_eq!(
         error,
@@ -916,8 +954,8 @@ fn filter_preserves_order_duplicates_and_passes_image_context() {
         .with_context()
         .filter(move |(ctx, address)| {
             assert!(!ctx.image().memory.sections().is_empty());
-            captured.lock().unwrap().push(address);
-            keep.contains(&address)
+            captured.lock().unwrap().push(*address.value);
+            keep.contains(&address.value)
         });
     assert_eq!(
         run(&scan_image(), matcher).unwrap(),
@@ -960,8 +998,8 @@ fn filter_modify_preserves_callback_order_duplicates_and_absolute_addresses() {
     let matcher = patterns(&["AA DD CC", "AA BB CC", "AA DD CC"])
         .with_context()
         .filter_modify(move |(ctx, address)| {
-            captured.lock().unwrap().push(address);
-            Ok((ctx.image().memory.u8(address + 1)? == 0xdd).then_some(0))
+            captured.lock().unwrap().push(*address.value);
+            Ok((ctx.image().memory.u8(*address.value + 1)? == 0xdd).then_some(0))
         });
     assert_eq!(run(&scan_image(), matcher).unwrap(), [0, 0]);
     assert_eq!(
@@ -972,7 +1010,7 @@ fn filter_modify_preserves_callback_order_duplicates_and_absolute_addresses() {
 
 #[test]
 fn filter_modify_handles_all_none_empty_and_inner_errors() {
-    let identity = patterns(&["AA ?? CC"]).filter_modify(|address| Ok(Some(address)));
+    let identity = patterns(&["AA ?? CC"]).filter_modify(|address| Ok(Some(*address.value)));
     assert_eq!(
         run(&scan_image(), identity).unwrap(),
         [TEXT + 8, TEXT + 24, TARGET]
@@ -999,8 +1037,8 @@ fn filter_modify_stops_at_first_error_after_dropped_results() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&seen);
     let matcher = patterns(&["AA ?? CC"]).filter_modify(move |address| {
-        captured.lock().unwrap().push(address);
-        if address == TEXT + 24 {
+        captured.lock().unwrap().push(*address.value);
+        if *address.value == TEXT + 24 {
             bail_out!("filter modification failed");
         }
         Ok(None::<u64>)
@@ -1018,7 +1056,9 @@ fn context_filter_modify_propagates_memory_errors() {
 
     let matcher = BinaryMatcher::address(0)
         .with_context()
-        .filter_modify(|(ctx, address)| Ok(Some(u64::from(ctx.image().memory.u8(address)?))));
+        .filter_modify(|(ctx, address)| {
+            Ok(Some(u64::from(ctx.image().memory.u8(*address.value)?)))
+        });
     assert_eq!(
         run(&scan_image(), matcher).unwrap_err(),
         ResolveError::from(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError)
@@ -1131,17 +1171,15 @@ fn first_and_last_match_at_index_values_and_errors() {
 }
 
 #[test]
-fn at_index_moves_non_clone_candidates() {
+fn at_index_selects_non_clone_candidates_without_cloning_values() {
     struct Candidate(String);
-    let matcher = Matcher::items::<Candidate>()
-        .at_index(-2)
-        .map(|candidate| candidate.0);
+    let matcher = Matcher::items::<Candidate>().at_index(-2);
     let input = ["first", "second", "third"]
         .map(|text| Candidate(text.into()))
         .into();
-    let result = run_stage(&scan_image(), matcher, input).unwrap();
+    let result = run_nodes(&scan_image(), matcher, input).unwrap();
 
-    assert_eq!(result, "second");
+    assert_eq!(result.value.0, "second");
 }
 
 #[test]
@@ -1160,12 +1198,12 @@ fn at_index_evaluates_upstream_once_and_preserves_its_error() {
 
 #[test]
 fn cardinality_preserving_operations_work_after_selectors() {
-    let matcher: Matcher<(), u64, ExactlyOne> = patterns(&["AA BB CC"])
+    let matcher: Matcher<(), u64, ExactlyOne, _> = patterns(&["AA BB CC"])
         .first()
         .offset(1)
         .with_context()
-        .map(|(_, address)| address)
-        .try_map(Ok)
+        .map(|(_, address)| *address.value)
+        .try_map(|node| Ok(*node.value))
         .addresses();
     let result: u64 = run_stage(&scan_image(), matcher, ()).unwrap();
 
@@ -1179,7 +1217,7 @@ fn memory_operations_preserve_exactly_one_through_pointer_chains() {
     bytes[16..24].copy_from_slice(&(TEXT + 24).to_le_bytes());
     bytes[24..32].copy_from_slice(&TARGET.to_le_bytes());
     let image = image(bytes);
-    let matcher: Matcher<(), u64, ExactlyOne> = patterns(&["E8 | ?? ?? ?? ??"])
+    let matcher: Matcher<(), u64, ExactlyOne, _> = patterns(&["E8 | ?? ?? ?? ??"])
         .ensure_one()
         .rip4()
         .deref()
@@ -1192,10 +1230,10 @@ fn memory_operations_preserve_exactly_one_through_pointer_chains() {
 #[test]
 fn filtering_and_expansion_return_variable_cardinality() {
     let filtered: Matcher<(), u64> = BinaryMatcher::address(10).ensure_one().filter(|_| false);
-    let expanded: Matcher<(), u64> = BinaryMatcher::address(10)
+    let expanded: Matcher<(), u64, Variable, _> = BinaryMatcher::address(10)
         .ensure_one()
-        .expand(|item| vec![item, item]);
-    let contextual: Matcher<(), u64> = BinaryMatcher::address(10)
+        .expand(|item| vec![*item.value, *item.value]);
+    let contextual: Matcher<(), u64, Variable, _> = BinaryMatcher::address(10)
         .ensure_one()
         .with_context()
         .filter_modify(|_| Ok(None));
@@ -1207,8 +1245,10 @@ fn filtering_and_expansion_return_variable_cardinality() {
 
 #[test]
 fn flat_map_evaluates_matchers_in_candidate_order_with_duplicates() {
-    let matcher = Matcher::items::<u64>()
-        .flat_map(|value| Matcher::from_sync(move |()| Ok(vec![value, value + 10])));
+    let matcher = Matcher::items::<u64>().flat_map(|value| {
+        let value = *value.value;
+        Matcher::from_sync(move |()| Ok(vec![value, value + 10]))
+    });
     let result = run_stage(&scan_image(), matcher, vec![3, 1, 3]).unwrap();
 
     assert_eq!(result, [3, 13, 1, 11, 3, 13]);
@@ -1216,9 +1256,9 @@ fn flat_map_evaluates_matchers_in_candidate_order_with_duplicates() {
 
 #[test]
 fn flat_map_accepts_exactly_one_inner_and_outer_matchers() {
-    let matcher: Matcher<(), u64> = BinaryMatcher::address(3)
+    let matcher: Matcher<(), u64, Variable, _> = BinaryMatcher::address(3)
         .ensure_one()
-        .flat_map(|value| BinaryMatcher::address(value).ensure_one().offset(1));
+        .flat_map(|value| BinaryMatcher::address(*value.value).ensure_one().offset(1));
     let result = run_stage(&scan_image(), matcher, ()).unwrap();
 
     assert_eq!(result, [4]);
@@ -1240,6 +1280,7 @@ fn flat_map_captures_non_clone_candidates_and_borrowed_data() {
     let prefix = String::from("prefix:");
     let matcher = Matcher::items::<Candidate>().flat_map(|candidate| {
         let prefix = prefix.as_str();
+        let candidate = candidate.clone();
         Matcher::from_value(move |()| Ok(format!("{prefix}{}", candidate.0)))
     });
     let result = run_stage(&scan_image(), matcher, vec![Candidate("payload".into())]).unwrap();
@@ -1252,6 +1293,7 @@ fn flat_map_runs_async_inner_matchers_against_the_current_image() {
     use patternsleuth::MemoryTrait;
 
     let matcher = Matcher::items::<u64>().flat_map(|address| {
+        let address = *address.value;
         Matcher::from_async(move |(), ctx| {
             Box::pin(async move { Ok(vec![u64::from(ctx.image().memory.u8(address)?)]) })
         })
@@ -1274,6 +1316,7 @@ fn flat_map_retains_nested_function_search_bounds() {
 #[test]
 fn flat_map_can_capture_reference_sites_while_resolving_functions() {
     let matcher = BinaryMatcher::address(TEXT + 24).flat_map(|reference| {
+        let reference = *reference.value;
         BinaryMatcher::address(reference)
             .root_functions()
             .map(move |function| (reference, function.start))
@@ -1288,9 +1331,9 @@ fn context_flat_map_passes_context_only_to_matcher_construction() {
     let matcher = BinaryMatcher::address(3)
         .with_context()
         .flat_map(|(ctx, value)| {
-            BinaryMatcher::address(ctx.image().base_address + value).ensure_one()
+            BinaryMatcher::address(ctx.image().base_address + *value.value).ensure_one()
         })
-        .map(|address| address + 1);
+        .map(|address| *address.value + 1);
     let result = run_stage(&scan_image(), matcher, ()).unwrap();
 
     assert_eq!(result, [BASE + 4]);
@@ -1298,8 +1341,8 @@ fn context_flat_map_passes_context_only_to_matcher_construction() {
 
 #[test]
 fn try_flat_map_stops_after_callback_errors() {
-    let matcher = Matcher::items::<u64>().try_flat_map(|value| match value {
-        1 => Ok(BinaryMatcher::address(value)),
+    let matcher = Matcher::items::<u64>().try_flat_map(|value| match *value.value {
+        1 => Ok(BinaryMatcher::address(*value.value)),
         2 => Err(ResolveError::new_msg("construction failed")),
         _ => panic!("construction error must skip later candidates"),
     });
@@ -1311,7 +1354,7 @@ fn try_flat_map_stops_after_callback_errors() {
 #[test]
 fn flat_map_stops_after_inner_errors_without_constructing_later_matchers() {
     let matcher = Matcher::items::<u64>().flat_map(|value| {
-        assert_eq!(value, 1);
+        assert_eq!(*value.value, 1);
         Matcher::from_sync(|()| -> Result<Vec<u64>> {
             Err(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError.into())
         })
@@ -1336,7 +1379,7 @@ fn flat_map_preserves_outer_errors_without_constructing_inner_matchers() {
 
 #[test]
 fn function_sub_accepts_both_exactly_one_receivers_and_inner_matchers() {
-    let matcher: Matcher<(), u64> = BinaryMatcher::address(TEXT)
+    let matcher: Matcher<(), u64, Variable, _> = BinaryMatcher::address(TEXT)
         .root_functions()
         .ensure_one()
         .sub(patterns(&["AA BB CC"]).first().offset(1));
@@ -1347,7 +1390,7 @@ fn function_sub_accepts_both_exactly_one_receivers_and_inner_matchers() {
 
 #[test]
 fn set_operations_accept_mixed_cardinalities_and_return_variable() {
-    let matcher: Matcher<(), u64> = BinaryMatcher::address(3)
+    let matcher: Matcher<(), u64, Variable, _> = BinaryMatcher::address(3)
         .ensure_one()
         .union(Matcher::from_sync(|()| Ok(vec![1, 3, 2])))
         .intersect(BinaryMatcher::address(3).ensure_one());
@@ -1538,7 +1581,7 @@ fn sub_scopes_custom_async_scans_and_context_callbacks() {
     .with_context()
     .map(|(ctx, address)| {
         assert_eq!(ctx.bounds(), Some(TEXT..TEXT + 16));
-        address
+        *address.value
     });
     let matcher = functions(&[(TEXT, TEXT + 16)]).sub(inner);
 
@@ -1575,13 +1618,14 @@ fn sub_propagates_outer_errors_without_running_the_inner_matcher() {
 
 #[test]
 fn all_wrappers_propagate_inner_errors() {
-    let wrappers: [for<'a> fn(BinaryMatcher<'a>) -> BinaryMatcher<'a>; 3] = [
-        |matcher| matcher.first().into_variable(),
-        |matcher| matcher.last().into_variable(),
-        |matcher| matcher.xrefs().addresses(),
-    ];
-    for wrap in wrappers {
-        assert!(run(&scan_image(), wrap(BinaryMatcher::address(0).offset(-1))).is_err());
+    for operation in 0..3 {
+        let matcher = BinaryMatcher::address(0).offset(-1);
+        let result = match operation {
+            0 => run(&scan_image(), matcher.first()),
+            1 => run(&scan_image(), matcher.last()),
+            _ => run(&scan_image(), matcher.xrefs()),
+        };
+        assert!(result.is_err());
     }
     assert!(
         run(
@@ -1603,7 +1647,9 @@ fn relative(text: &mut [u8], at: usize, opcode: &[u8], target: u64) {
     text[at + opcode.len()..at + opcode.len() + 4].copy_from_slice(&displacement.to_le_bytes());
 }
 
-fn xrefs<'scope>(target: u64) -> BinaryMatcher<'scope> {
+fn xrefs<'scope>(
+    target: u64,
+) -> Matcher<'scope, (), u64, Variable, Function<Reference<Trace<u64>>>> {
     BinaryMatcher::address(target).xrefs().addresses()
 }
 
@@ -1727,7 +1773,7 @@ fn callees_preserve_input_order_duplicate_targets_and_recursive_calls() {
     relative(&mut text, 0xa8, &[0xe8], SHARED_CALLER);
     let image = image.with_text(text).unwrap();
     let matcher = patterns(&["E8 ?? ?? ?? ??"])
-        .filter(|address| [SHARED_CALLER + 8, SHARED_CALLER + 0x18].contains(&address))
+        .filter(|address| [SHARED_CALLER + 8, SHARED_CALLER + 0x18].contains(&address.value))
         .callees();
     assert_eq!(
         run(&image, matcher).unwrap(),
@@ -1802,39 +1848,46 @@ fn outgoing_calls_stop_at_function_boundary_and_indirect_jumps() {
 
 #[test]
 fn traversal_handles_empty_unknown_and_unreferenced_inputs() {
-    let wrappers: [for<'a> fn(BinaryMatcher<'a>) -> BinaryMatcher<'a>; 5] = [
-        |matcher: BinaryMatcher| matcher.references().addresses(),
-        |matcher: BinaryMatcher| matcher.callers().addresses(),
-        |matcher: BinaryMatcher| matcher.root_functions().addresses(),
-        |matcher: BinaryMatcher| matcher.callees().addresses(),
-        |matcher: BinaryMatcher| matcher.call_sites().addresses(),
-    ];
-    for wrap in wrappers {
-        assert!(run(&scan_image(), wrap(patterns(&[]))).unwrap().is_empty());
+    for operation in 0..5 {
+        for addresses in [vec![], vec![0]] {
+            let matcher = BinaryMatcher::candidates(addresses);
+            let result = match operation {
+                0 => run(&scan_image(), matcher.references()),
+                1 => run(&scan_image(), matcher.callers()),
+                2 => run(&scan_image(), matcher.root_functions()),
+                3 => run(&scan_image(), matcher.callees()),
+                _ => run(&scan_image(), matcher.call_sites()),
+            };
+            assert!(result.unwrap().is_empty());
+        }
+        let matcher = BinaryMatcher::address(0).offset(-1);
+        let result = match operation {
+            0 => run(&scan_image(), matcher.references()),
+            1 => run(&scan_image(), matcher.callers()),
+            2 => run(&scan_image(), matcher.root_functions()),
+            3 => run(&scan_image(), matcher.callees()),
+            _ => run(&scan_image(), matcher.call_sites()),
+        };
         assert!(
-            run(&scan_image(), wrap(BinaryMatcher::address(0)))
-                .unwrap()
-                .is_empty()
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("address offset overflow")
         );
-        let error = run(&scan_image(), wrap(BinaryMatcher::address(0).offset(-1))).unwrap_err();
-        assert!(error.to_string().contains("address offset overflow"));
     }
 }
 
 #[test]
 fn function_traversal_accepts_an_empty_function_table() {
     let image = construct_image(vec![0x90; 64], 0);
-    let wrappers: [for<'a> fn(BinaryMatcher<'a>) -> BinaryMatcher<'a>; 3] = [
-        |matcher: BinaryMatcher| matcher.root_functions().addresses(),
-        |matcher: BinaryMatcher| matcher.callees().addresses(),
-        |matcher: BinaryMatcher| matcher.call_sites().addresses(),
-    ];
-    for wrap in wrappers {
-        assert!(
-            run(&image, wrap(BinaryMatcher::address(TEXT)))
-                .unwrap()
-                .is_empty()
-        );
+    for operation in 0..3 {
+        let matcher = BinaryMatcher::address(TEXT);
+        let result = match operation {
+            0 => run(&image, matcher.root_functions()),
+            1 => run(&image, matcher.callees()),
+            _ => run(&image, matcher.call_sites()),
+        };
+        assert!(result.unwrap().is_empty());
     }
 }
 
@@ -1954,7 +2007,7 @@ fn disassemble_preserves_candidate_order_duplicates_and_cardinality() {
     let mut text = vec![0x90; 256];
     text[0] = 0xc3;
     text[64] = 0xc3;
-    let matcher: Matcher<(), Vec<iced_x86::Instruction>> =
+    let matcher: Matcher<(), Vec<iced_x86::Instruction>, Variable, _> =
         BinaryMatcher::candidates([TEXT + 64, TEXT, TEXT + 64])
             .root_functions()
             .disassemble();
@@ -2046,9 +2099,10 @@ fn disassemble_reusable_stage_collects_one_vector_per_function() {
 
 #[test]
 fn map_filter_preserves_order_and_duplicates_but_returns_variable() {
-    let matcher: Matcher<Vec<u64>, u64> =
-        Matcher::items::<u64>().map_filter(|value| (value > 1).then_some(value * 2));
-    let exact: Matcher<(), u64> = BinaryMatcher::address(1).ensure_one().map_filter(|_| None);
+    let matcher: Matcher<Vec<u64>, u64, Variable, _> =
+        Matcher::items::<u64>().map_filter(|value| (*value.value > 1).then_some(*value.value * 2));
+    let exact: Matcher<(), u64, Variable, _> =
+        BinaryMatcher::address(1).ensure_one().map_filter(|_| None);
 
     assert_eq!(
         run_stage(&scan_image(), matcher, vec![3, 1, 3, 2]).unwrap(),
@@ -2061,8 +2115,8 @@ fn map_filter_preserves_order_and_duplicates_but_returns_variable() {
 fn map_filter_skips_empty_input_and_supports_non_clone_values() {
     let empty = Matcher::items::<u64>()
         .map_filter(|_| -> Option<u64> { panic!("empty candidates must skip callbacks") });
-    let matcher =
-        Matcher::items::<String>().map_filter(|value| (!value.is_empty()).then_some(value));
+    let matcher = Matcher::items::<String>()
+        .map_filter(|value| (!value.is_empty()).then(|| value.value.as_ref().clone()));
 
     assert!(run_stage(&scan_image(), empty, vec![]).unwrap().is_empty());
     assert_eq!(
@@ -2073,8 +2127,8 @@ fn map_filter_skips_empty_input_and_supports_non_clone_values() {
 
 #[test]
 fn try_map_filter_stops_at_the_first_error() {
-    let matcher = Matcher::items::<u64>().try_map_filter(|value| match value {
-        1 => Ok(Some(value)),
+    let matcher = Matcher::items::<u64>().try_map_filter(|value| match *value.value {
+        1 => Ok(Some(*value.value)),
         2 => Err(ResolveError::new_msg("filter failed")),
         _ => panic!("error must skip later candidates"),
     });
@@ -2087,8 +2141,8 @@ fn try_map_filter_stops_at_the_first_error() {
 fn context_map_filter_returns_to_data_only_callbacks() {
     let matcher = BinaryMatcher::address(3)
         .with_context()
-        .map_filter(|(ctx, value)| Some(ctx.image().base_address + value))
-        .map(|value| value + 1);
+        .map_filter(|(ctx, value)| Some(ctx.image().base_address + *value.value))
+        .map(|value| *value.value + 1);
     let result = run_stage(&scan_image(), matcher, ()).unwrap();
 
     assert_eq!(result, [BASE + 4]);
@@ -2096,18 +2150,24 @@ fn context_map_filter_returns_to_data_only_callbacks() {
 
 #[test]
 fn outgoing_calls_propagate_memory_and_invalid_instruction_errors() {
-    let wrappers: [for<'a> fn(BinaryMatcher<'a>) -> BinaryMatcher<'a>; 2] = [
-        |matcher: BinaryMatcher| matcher.callees().addresses(),
-        |matcher: BinaryMatcher| matcher.call_sites().addresses(),
-    ];
-    for wrap in wrappers {
+    for operation in 0..2 {
         let missing = call_graph().without_section(".text");
-        let error = run(&missing, wrap(BinaryMatcher::address(TEXT))).unwrap_err();
+        let matcher = BinaryMatcher::address(TEXT);
+        let result = match operation {
+            0 => run(&missing, matcher.callees()),
+            _ => run(&missing, matcher.call_sites()),
+        };
+        let error = result.unwrap_err();
         assert_eq!(
             error,
             ResolveError::from(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError)
         );
-        let error = run(&image(vec![0x0f]), wrap(BinaryMatcher::address(TEXT))).unwrap_err();
+        let matcher = BinaryMatcher::address(TEXT);
+        let result = match operation {
+            0 => run(&image(vec![0x0f]), matcher.callees()),
+            _ => run(&image(vec![0x0f]), matcher.call_sites()),
+        };
+        let error = result.unwrap_err();
         assert!(error.to_string().contains("invalid instruction"));
     }
 }

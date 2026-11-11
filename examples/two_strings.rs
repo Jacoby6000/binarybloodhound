@@ -1,16 +1,16 @@
 use std::collections::HashSet;
 
 use anyhow::{Result, ensure};
-use binary_bloodhound::BinaryMatcher;
+use binary_bloodhound::{BinaryMatcher, FunctionEntry, Matcher, Reference, Trace, Variable};
 use patternsleuth::{image::Image, resolvers::eval, scanner::Pattern};
 
-fn string_references<'scope>(value: &str) -> Result<BinaryMatcher<'scope>> {
+fn string_references<'scope>(
+    value: &str,
+) -> Result<Matcher<'scope, (), FunctionEntry, Variable, Reference<Trace<u64>>>> {
     // Match a complete, null-terminated UTF-8 literal, not a longer prefix.
     let mut bytes = value.as_bytes().to_vec();
     bytes.push(0);
-    Ok(BinaryMatcher::pattern(Pattern::from_bytes(bytes)?)
-        .xrefs()
-        .addresses())
+    Ok(BinaryMatcher::pattern(Pattern::from_bytes(bytes)?).xrefs())
 }
 
 pub fn methods_referencing_both(image: &Image<'_>, first: &str, second: &str) -> Result<Vec<u64>> {
@@ -19,14 +19,24 @@ pub fn methods_referencing_both(image: &Image<'_>, first: &str, second: &str) ->
 
     eval(image, move |ctx| {
         Box::pin(async move {
-            let mut candidates = first.resolve(ctx).await?;
+            let mut candidates: Vec<u64> = first
+                .resolve(ctx)
+                .await?
+                .into_iter()
+                .map(|node| node.value.start)
+                .collect();
             if candidates.is_empty() {
                 return Ok(candidates);
             }
 
             // XRefs returns containing function starts. Intersecting these sets finds
             // functions referencing both literals, not callers of those functions.
-            let second_refs: HashSet<_> = second.resolve(ctx).await?.into_iter().collect();
+            let second_refs: HashSet<_> = second
+                .resolve(ctx)
+                .await?
+                .into_iter()
+                .map(|node| node.value.start)
+                .collect();
             candidates.retain(|address| second_refs.contains(address));
             candidates.sort_unstable();
             candidates.dedup();

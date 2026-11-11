@@ -38,14 +38,14 @@ impl_resolver_singleton!(all, ConsoleManagerSingleton, |ctx| async {
     .await?;
     let patterns = strings
         .into_iter()
-        .map(|address| format!("48 8d 15 X0x{address:x}"));
+        .map(|address| format!("48 8d 15 X0x{:x}", *address.value));
     let address = BinaryMatcher::patterns(patterns)?
         .root_functions()
         .addresses()
         .ensure_one()
         .resolve(ctx)
         .await?;
-    Ok(Self(address))
+    Ok(Self(*address.value))
 });
 
 pub use models::objects::UObjectBaseUtilityGetPathName;
@@ -53,7 +53,7 @@ impl_resolver_singleton!(all, UObjectBaseUtilityGetPathName, |ctx| async {
     let address = BinaryMatcher::patterns([
         "40 53 48 81 EC 50 02 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 ?? ?? ?? ?? 48 8D 44 24",
     ])?.ensure_one().resolve(ctx).await?;
-    Ok(Self(address))
+    Ok(Self(*address.value))
 });
 
 // Select these factories explicitly: upstream resolvers share this process's inventory.

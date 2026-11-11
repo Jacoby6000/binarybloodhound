@@ -26,9 +26,9 @@ impl_resolver_singleton!(all, UObjectSkipFunction, |ctx| async {
 
     BinaryMatcher::patterns(patterns)?
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 // GNatives
@@ -72,9 +72,9 @@ impl_resolver_singleton!(PEImage, GNativesPatterns, |ctx| async {
     BinaryMatcher::patterns(patterns)?
         .rip4()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 impl_resolver_singleton!(ElfImage, GNativesPatterns, |_ctx| async {
@@ -175,9 +175,9 @@ impl_resolver_singleton!(all, FFrameStep, |ctx| async {
 
     BinaryMatcher::patterns(patterns)?
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 /// public: void __cdecl FFrame::StepExplicitProperty(void *const, class FProperty *)
@@ -193,9 +193,9 @@ impl_resolver_singleton!(all, FFrameStepExplicitProperty, |ctx| async {
 
     BinaryMatcher::patterns(patterns)?
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 /// public: static void __cdecl UKismetStringLibrary::execLen(class UObject *, struct FFrame &, void *const)

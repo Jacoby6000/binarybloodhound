@@ -4,9 +4,9 @@ The Rust toolchain configuration installs Clippy and rustfmt through rustup.
 
 ```sh
 cargo fmt --all                       # Format code
-rustfmt src/tests/shared.rs           # Format the include!-based tests
+rustfmt src/tests/{shared,provenance,walk_disassembly}.rs
 cargo fmt --all -- --check            # Check formatting
-rustfmt --check src/tests/shared.rs   # Check the include!-based tests
+rustfmt --check src/tests/{shared,provenance,walk_disassembly}.rs
 cargo typecheck --all-features        # Compile-check library, tests, and examples
 cargo lint --all-features             # Run Clippy
 ```

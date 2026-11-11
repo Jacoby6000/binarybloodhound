@@ -1,178 +1,254 @@
+use std::sync::Arc;
+
 use futures::future::BoxFuture;
 use patternsleuth::resolvers::Result;
-use std::marker::PhantomData;
 
-use super::{Cardinality, ExactlyOne, MatchContext, Matcher, Variable};
+use crate::{
+    Cardinality, Composition, ExactlyOne, MatchContext, Matcher, Trace, Variable, pipeline::Run,
+};
 
-struct Transform<'scope, I, O, C: Cardinality, F> {
-    matcher: Matcher<'scope, I, O, C>,
+struct FlatMap<'scope, I, O, P, C: Cardinality, F> {
+    matcher: Matcher<'scope, I, O, C, P>,
     func: F,
 }
-
-struct FlatMap<'scope, I, O, C: Cardinality, D: Cardinality, F> {
-    matcher: Matcher<'scope, I, O, C>,
-    func: F,
-    inner_cardinality: PhantomData<D>,
-}
-
 impl<
     'scope,
     I: Send + 'scope,
-    O: Send + 'scope,
-    U: Send + 'scope,
+    O: Send + Sync + 'scope,
+    P: Send + Sync + 'scope,
+    U: Send + Sync + 'scope,
+    Q: Send + Sync + 'scope,
     C: Cardinality,
     D: Cardinality,
     F,
-> super::pipeline::Run<I, U> for FlatMap<'scope, I, O, C, D, F>
+> Run<I, Trace<U, Composition<Trace<O, P>, Q>>> for FlatMap<'scope, I, O, P, C, F>
 where
-    F: Fn((MatchContext<'_, '_>, O)) -> Result<Matcher<'scope, (), U, D>> + Send + Sync,
+    F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<Matcher<'scope, (), U, D, Q>>
+        + Send
+        + Sync,
 {
     fn run<'ctx, 'image>(
         &'ctx self,
         input: I,
         ctx: MatchContext<'ctx, 'image>,
-    ) -> BoxFuture<'ctx, Result<Vec<U>>>
+    ) -> BoxFuture<'ctx, Result<Vec<Trace<U, Composition<Trace<O, P>, Q>>>>>
     where
         I: 'ctx,
-        U: 'ctx,
+        Trace<U, Composition<Trace<O, P>, Q>>: 'ctx,
     {
         Box::pin(async move {
-            let items = self.matcher.run_in(input, ctx).await?;
             let mut result = Vec::new();
-            for item in items {
-                let matcher = (self.func)((ctx, item))?;
-                result.extend(matcher.run_in((), ctx).await?);
+            for node in self.matcher.run_in(input, ctx).await? {
+                let parent = Arc::new(node);
+                let matcher = (self.func)((ctx, &parent))?;
+                let nodes = D::into_items(D::finish(matcher.run_in((), ctx).await?)?);
+                result.extend(
+                    nodes
+                        .into_iter()
+                        .map(|node| node.compose(Arc::clone(&parent))),
+                );
             }
             Ok(result)
         })
     }
 }
 
-impl<'scope, I: Send + 'scope, O: Send + 'scope, U: Send, C: Cardinality, F>
-    super::pipeline::Run<I, U> for Transform<'scope, I, O, C, F>
-where
-    F: Fn((MatchContext<'_, '_>, Vec<O>)) -> Result<Vec<U>> + Send + Sync,
-{
-    fn run<'ctx, 'image>(
-        &'ctx self,
-        input: I,
-        ctx: MatchContext<'ctx, 'image>,
-    ) -> BoxFuture<'ctx, Result<Vec<U>>>
-    where
-        I: 'ctx,
-        U: 'ctx,
-    {
-        Box::pin(async move { (self.func)((ctx, self.matcher.run_in(input, ctx).await?)) })
-    }
-}
-
-/// Supply context to one transformation, then return to data-only callbacks.
-/// Mapping preserves cardinality; filtering and expansion return Variable.
-///
-/// ```compile_fail
-/// use binary_bloodhound::BinaryMatcher;
-/// let invalid = BinaryMatcher::address(0x1000).ensure_one()
-///     .with_context().map(|(ctx, _)| ctx.native());
-/// ```
-///
-/// The adapter is consumed; subsequent callbacks are data-only:
-///
-/// ```compile_fail
-/// use binary_bloodhound::BinaryMatcher;
-/// let invalid = BinaryMatcher::address(0x1000).ensure_one()
-///     .with_context().map(|(_, address)| address)
-///     .map(|(ctx, address)| address);
-/// ```
+/// One-shot context adapter; callbacks still borrow immutable candidates.
 #[must_use = "with_context applies only when followed by a transformation"]
-pub struct WithContext<'scope, I, O, C: Cardinality = Variable> {
-    pub(super) matcher: Matcher<'scope, I, O, C>,
+pub struct WithContext<'scope, I, O, C: Cardinality = Variable, P = ()> {
+    pub(super) matcher: Matcher<'scope, I, O, C, P>,
 }
-
-impl<'scope, I: Send + 'scope, O: Send + 'scope, C: Cardinality> WithContext<'scope, I, O, C> {
-    fn transform_items<U: Send + 'scope, D: Cardinality, F>(
-        self,
-        func: F,
-    ) -> Matcher<'scope, I, U, D>
+impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope, C: Cardinality>
+    WithContext<'scope, I, O, C, P>
+{
+    pub fn map<U: Send + Sync + 'scope, F>(self, func: F) -> Matcher<'scope, I, U, C, Trace<O, P>>
     where
-        F: Fn((MatchContext<'_, '_>, Vec<O>)) -> Result<Vec<U>> + Send + Sync + 'scope,
-    {
-        Matcher::from_run(Transform {
-            matcher: self.matcher,
-            func,
-        })
-    }
-
-    /// Transform one candidate at a time. Empty collections skip the callback.
-    pub fn map<U, F>(self, func: F) -> Matcher<'scope, I, U, C>
-    where
-        U: Send + 'scope,
-        F: Fn((MatchContext<'_, '_>, O)) -> U + Send + Sync + 'scope,
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> U + Send + Sync + 'scope,
     {
         self.try_map(move |input| Ok(func(input)))
     }
-
-    /// Stop at the first error, retaining cardinality on success.
-    pub fn try_map<U, F>(self, func: F) -> Matcher<'scope, I, U, C>
+    pub fn try_map<U: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, C, Trace<O, P>>
     where
-        U: Send + 'scope,
-        F: Fn((MatchContext<'_, '_>, O)) -> Result<U> + Send + Sync + 'scope,
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<U> + Send + Sync + 'scope,
     {
-        self.transform_items(move |(ctx, items)| {
-            items.into_iter().map(|item| func((ctx, item))).collect()
+        self.matcher.transform_nodes(move |(ctx, nodes)| {
+            nodes
+                .into_iter()
+                .map(|node| {
+                    let value = func((ctx, &node))?;
+                    Ok(Trace::child(value, Arc::new(node)))
+                })
+                .collect()
         })
     }
-
-    /// Transform the resolved whole output into one candidate.
-    pub fn transform<U, F>(self, func: F) -> Matcher<'scope, I, U, ExactlyOne>
+    pub fn map_filter<U: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, Variable, Trace<O, P>>
     where
-        U: Send + 'scope,
-        F: Fn((MatchContext<'_, '_>, C::Output<O>)) -> U + Send + Sync + 'scope,
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Option<U> + Send + Sync + 'scope,
+    {
+        self.try_map_filter(move |input| Ok(func(input)))
+    }
+    pub fn try_map_filter<U: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, Variable, Trace<O, P>>
+    where
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<Option<U>> + Send + Sync + 'scope,
+    {
+        self.matcher.transform_nodes(move |(ctx, nodes)| {
+            let mut result = Vec::new();
+            for node in nodes {
+                if let Some(value) = func((ctx, &node))? {
+                    result.push(Trace::child(value, Arc::new(node)));
+                }
+            }
+            Ok(result)
+        })
+    }
+    pub fn filter_modify<U: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, Variable, Trace<O, P>>
+    where
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<Option<U>> + Send + Sync + 'scope,
+    {
+        self.try_map_filter(func)
+    }
+    pub fn expand<U: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, Variable, Trace<O, P>>
+    where
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Vec<U> + Send + Sync + 'scope,
+    {
+        self.try_expand(move |input| Ok(func(input)))
+    }
+    pub fn try_expand<U: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, Variable, Trace<O, P>>
+    where
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<Vec<U>> + Send + Sync + 'scope,
+    {
+        self.matcher.transform_nodes(move |(ctx, nodes)| {
+            let mut result = Vec::new();
+            for node in nodes {
+                let values = func((ctx, &node))?;
+                let parent = Arc::new(node);
+                result.extend(
+                    values
+                        .into_iter()
+                        .map(|value| Trace::child(value, Arc::clone(&parent))),
+                );
+            }
+            Ok(result)
+        })
+    }
+    pub fn filter<F>(self, predicate: F) -> Matcher<'scope, I, O, Variable, P>
+    where
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> bool + Send + Sync + 'scope,
+    {
+        self.filter_each(predicate)
+    }
+    pub fn filter_each<F>(self, predicate: F) -> Matcher<'scope, I, O, Variable, P>
+    where
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> bool + Send + Sync + 'scope,
+    {
+        self.try_filter(move |input| Ok(predicate(input)))
+    }
+    pub fn try_filter<F>(self, predicate: F) -> Matcher<'scope, I, O, Variable, P>
+    where
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<bool> + Send + Sync + 'scope,
+    {
+        self.matcher.transform_nodes(move |(ctx, nodes)| {
+            nodes
+                .into_iter()
+                .filter_map(|node| match predicate((ctx, &node)) {
+                    Ok(true) => Some(Ok(node)),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .collect()
+        })
+    }
+    pub fn transform<U: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, ExactlyOne, C::Output<Trace<O, P>>>
+    where
+        C::Output<Trace<O, P>>: Sync,
+        F: Fn((MatchContext<'_, '_>, &C::Output<Trace<O, P>>)) -> U + Send + Sync + 'scope,
     {
         self.try_transform(move |input| Ok(func(input)))
     }
-
-    pub fn try_transform<U, F>(self, func: F) -> Matcher<'scope, I, U, ExactlyOne>
+    pub fn try_transform<U: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, ExactlyOne, C::Output<Trace<O, P>>>
     where
-        U: Send + 'scope,
-        F: Fn((MatchContext<'_, '_>, C::Output<O>)) -> Result<U> + Send + Sync + 'scope,
+        C::Output<Trace<O, P>>: Sync,
+        F: Fn((MatchContext<'_, '_>, &C::Output<Trace<O, P>>)) -> Result<U> + Send + Sync + 'scope,
     {
-        self.transform_items(move |(ctx, items)| Ok(vec![func((ctx, C::finish(items)?))?]))
+        self.matcher.transform_nodes(move |(ctx, nodes)| {
+            let parent = C::finish(nodes)?;
+            let value = func((ctx, &parent))?;
+            Ok(vec![Trace::child(value, Arc::new(parent))])
+        })
     }
-
-    /// Transform all candidates into a new variable collection.
-    pub fn transform_all<U, F>(self, func: F) -> Matcher<'scope, I, U>
+    pub fn transform_all<U: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, Variable, Vec<Trace<O, P>>>
     where
-        U: Send + 'scope,
-        F: Fn((MatchContext<'_, '_>, Vec<O>)) -> Vec<U> + Send + Sync + 'scope,
+        F: Fn((MatchContext<'_, '_>, &[Trace<O, P>])) -> Vec<U> + Send + Sync + 'scope,
     {
         self.try_transform_all(move |input| Ok(func(input)))
     }
-
-    pub fn try_transform_all<U, F>(self, func: F) -> Matcher<'scope, I, U>
+    pub fn try_transform_all<U: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, Variable, Vec<Trace<O, P>>>
     where
-        U: Send + 'scope,
-        F: Fn((MatchContext<'_, '_>, Vec<O>)) -> Result<Vec<U>> + Send + Sync + 'scope,
+        F: Fn((MatchContext<'_, '_>, &[Trace<O, P>])) -> Result<Vec<U>> + Send + Sync + 'scope,
     {
-        self.transform_items(func)
+        self.matcher.transform_nodes(move |(ctx, nodes)| {
+            let values = func((ctx, &nodes))?;
+            let parent = Arc::new(nodes);
+            Ok(values
+                .into_iter()
+                .map(|value| Trace::child(value, Arc::clone(&parent)))
+                .collect())
+        })
     }
-
-    /// Build and evaluate a matcher for each candidate, using this run's context and bounds.
-    /// Inner matchers run sequentially; concatenate their results without deduplication.
-    pub fn flat_map<U, D, F>(self, func: F) -> Matcher<'scope, I, U>
+    pub fn flat_map<U, Q, D, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, Variable, Composition<Trace<O, P>, Q>>
     where
-        U: Send + 'scope,
+        U: Send + Sync + 'scope,
+        Q: Send + Sync + 'scope,
         D: Cardinality,
-        F: Fn((MatchContext<'_, '_>, O)) -> Matcher<'scope, (), U, D> + Send + Sync + 'scope,
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Matcher<'scope, (), U, D, Q>
+            + Send
+            + Sync
+            + 'scope,
     {
         self.try_flat_map(move |input| Ok(func(input)))
     }
-
-    /// Fallible matcher construction; callback and inner errors stop later candidates.
-    pub fn try_flat_map<U, D, F>(self, func: F) -> Matcher<'scope, I, U>
+    pub fn try_flat_map<U, Q, D, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, Variable, Composition<Trace<O, P>, Q>>
     where
-        U: Send + 'scope,
+        U: Send + Sync + 'scope,
+        Q: Send + Sync + 'scope,
         D: Cardinality,
-        F: Fn((MatchContext<'_, '_>, O)) -> Result<Matcher<'scope, (), U, D>>
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<Matcher<'scope, (), U, D, Q>>
             + Send
             + Sync
             + 'scope,
@@ -180,89 +256,16 @@ impl<'scope, I: Send + 'scope, O: Send + 'scope, C: Cardinality> WithContext<'sc
         Matcher::from_run(FlatMap {
             matcher: self.matcher,
             func,
-            inner_cardinality: PhantomData,
         })
-    }
-
-    /// Expand each candidate into an ordinary vector, without evaluating another matcher.
-    pub fn expand<U, F>(self, func: F) -> Matcher<'scope, I, U>
-    where
-        U: Send + 'scope,
-        F: Fn((MatchContext<'_, '_>, O)) -> Vec<U> + Send + Sync + 'scope,
-    {
-        self.try_expand(move |input| Ok(func(input)))
-    }
-
-    pub fn try_expand<U, F>(self, func: F) -> Matcher<'scope, I, U>
-    where
-        U: Send + 'scope,
-        F: Fn((MatchContext<'_, '_>, O)) -> Result<Vec<U>> + Send + Sync + 'scope,
-    {
-        self.transform_items(move |(ctx, items)| {
-            let mut result = Vec::new();
-            for item in items {
-                result.extend(func((ctx, item))?);
-            }
-            Ok(result)
-        })
-    }
-
-    pub fn filter_each<F>(self, predicate: F) -> Matcher<'scope, I, O>
-    where
-        F: Fn((MatchContext<'_, '_>, &O)) -> bool + Send + Sync + 'scope,
-    {
-        self.try_filter(move |input| Ok(predicate(input)))
-    }
-
-    pub fn try_filter<F>(self, predicate: F) -> Matcher<'scope, I, O>
-    where
-        F: Fn((MatchContext<'_, '_>, &O)) -> Result<bool> + Send + Sync + 'scope,
-    {
-        self.filter_modify(move |(ctx, item)| Ok(predicate((ctx, &item))?.then_some(item)))
-    }
-
-    /// Map candidates to optional values with context, discarding None results.
-    pub fn map_filter<U, F>(self, func: F) -> Matcher<'scope, I, U>
-    where
-        U: Send + 'scope,
-        F: Fn((MatchContext<'_, '_>, O)) -> Option<U> + Send + Sync + 'scope,
-    {
-        self.try_map_filter(move |input| Ok(func(input)))
-    }
-
-    /// Fallible map_filter; stop at the first callback error.
-    pub fn try_map_filter<U, F>(self, func: F) -> Matcher<'scope, I, U>
-    where
-        U: Send + 'scope,
-        F: Fn((MatchContext<'_, '_>, O)) -> Result<Option<U>> + Send + Sync + 'scope,
-    {
-        self.try_expand(move |input| Ok(func(input)?.into_iter().collect()))
-    }
-
-    pub fn filter_modify<U, F>(self, func: F) -> Matcher<'scope, I, U>
-    where
-        U: Send + 'scope,
-        F: Fn((MatchContext<'_, '_>, O)) -> Result<Option<U>> + Send + Sync + 'scope,
-    {
-        self.try_map_filter(func)
     }
 }
 
-impl<'scope, I: Send + 'scope, O: Copy + Send + 'scope, C: Cardinality>
-    WithContext<'scope, I, O, C>
+impl<'scope, I: Send + 'scope, P: Send + Sync + 'scope, C: Cardinality>
+    WithContext<'scope, I, u64, C, P>
 {
-    pub fn filter<F>(self, predicate: F) -> Matcher<'scope, I, O>
+    pub fn modify_with<F>(self, func: F) -> Matcher<'scope, I, u64, C, Trace<u64, P>>
     where
-        F: Fn((MatchContext<'_, '_>, O)) -> bool + Send + Sync + 'scope,
-    {
-        self.filter_each(move |(ctx, item)| predicate((ctx, *item)))
-    }
-}
-
-impl<'scope, I: Send + 'scope, C: Cardinality> WithContext<'scope, I, u64, C> {
-    pub fn modify_with<F>(self, func: F) -> Matcher<'scope, I, u64, C>
-    where
-        F: Fn((MatchContext<'_, '_>, u64)) -> Result<u64> + Send + Sync + 'scope,
+        F: Fn((MatchContext<'_, '_>, &Trace<u64, P>)) -> Result<u64> + Send + Sync + 'scope,
     {
         self.try_map(func)
     }

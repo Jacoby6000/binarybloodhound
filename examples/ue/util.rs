@@ -13,6 +13,9 @@ pub async fn string_pattern(ctx: &AsyncContext<'_>, string: &str) -> Vec<u64> {
         .resolve(ctx)
         .await
         .expect("pattern scan")
+        .into_iter()
+        .map(|node| *node.value)
+        .collect()
 }
 
 pub async fn scan_xrefs(
@@ -26,6 +29,9 @@ pub async fn scan_xrefs(
         .resolve(ctx)
         .await
         .expect("reference scan")
+        .into_iter()
+        .map(|node| *node.value)
+        .collect()
 }
 
 pub async fn scan_xcalls(
@@ -39,4 +45,7 @@ pub async fn scan_xcalls(
         .resolve(ctx)
         .await
         .expect("caller scan")
+        .into_iter()
+        .map(|node| *node.value)
+        .collect()
 }

@@ -24,7 +24,7 @@ impl_resolver_singleton!(all, FUObjectHashTablesGet, |ctx| async {
     BinaryMatcher::patterns(patterns)?
         .rip4()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });

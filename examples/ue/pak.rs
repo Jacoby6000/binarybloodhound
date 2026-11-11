@@ -26,7 +26,7 @@ impl_resolver_singleton!(PEImage, FPakPlatformFileInitialize, |ctx| async {
             "Signedpak\0"
         ]),
     );
-    Ok(Self(b.or(a)?))
+    Ok(Self(*b.or(a)?.value))
 });
 impl_resolver_singleton!(ElfImage, FPakPlatformFileInitialize, |_ctx| async {
     patternsleuth::resolvers::bail_out!("ElfImage unimplemented");

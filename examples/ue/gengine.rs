@@ -11,12 +11,12 @@ impl_resolver_singleton!(PEImage, GEngine, |ctx| async {
 
     BinaryMatcher::pattern(util::utf16_pattern("rhi.DumpMemory\0"))
         .references()
+        .root_functions()
         .walk_disassembly(
-            |reference| (reference.0, None, None),
-            |(reference_addr, start, rcx), inst| {
+            |root| (root.value.start, root.parent().value.0, None),
+            |(start, reference_addr, rcx), inst| {
                 let ip = inst.ip();
                 let op0_reg = inst.op0_register();
-                let start = start.unwrap_or(ip);
 
                 if !(start..=reference_addr).contains(&ip) {
                     return Ok(Control::Break);
@@ -26,18 +26,18 @@ impl_resolver_singleton!(PEImage, GEngine, |ctx| async {
                         Ok(rcx.map_or(Control::Break, Control::Return))
                     }
                     Register::RCX if inst.is_ip_rel_memory_operand() => Ok(Control::Continue((
+                        start,
                         reference_addr,
-                        Some(start),
                         Some(inst.ip_rel_memory_address()),
                     ))),
-                    _ => Ok(Control::Continue((reference_addr, Some(start), rcx))),
+                    _ => Ok(Control::Continue((start, reference_addr, rcx))),
                 }
             },
         )
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 impl_resolver_singleton!(ElfImage, GEngine, |_ctx| async {
     patternsleuth::resolvers::bail_out!("ElfImage unimplemented");

@@ -17,9 +17,9 @@ impl_resolver_singleton!(all, UGameplayStaticsSaveGameToMemory, |ctx| async {
 
     BinaryMatcher::patterns(patterns)?
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 /// public: static bool __cdecl UGameplayStatics::SaveGameToSlot(class USaveGame *, class FString const &, int)
@@ -35,9 +35,9 @@ impl_resolver_singleton!(all, UGameplayStaticsSaveGameToSlot, |ctx| async {
 
     BinaryMatcher::patterns(patterns)?
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 /// public: static class USaveGame * __cdecl UGameplayStatics::LoadGameFromMemory(class TArray<unsigned char, class TSizedDefaultAllocator<32> > const &)
@@ -55,9 +55,9 @@ impl_resolver_singleton!(all, UGameplayStaticsLoadGameFromMemory, |ctx| async {
 
     BinaryMatcher::patterns(patterns)?
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 /// public: static class USaveGame * __cdecl UGameplayStatics::LoadGameFromSlot(class FString const &, int)
@@ -75,9 +75,9 @@ impl_resolver_singleton!(all, UGameplayStaticsLoadGameFromSlot, |ctx| async {
 
     BinaryMatcher::patterns(patterns)?
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 // not exists on linux
@@ -92,7 +92,7 @@ impl_resolver_singleton!(all, UGameplayStaticsDoesSaveGameExist, |ctx| async {
 
     BinaryMatcher::patterns(patterns)?
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });

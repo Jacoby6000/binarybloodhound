@@ -10,6 +10,9 @@ pub(super) async fn scan(ctx: &AsyncContext<'_>, pattern: Pattern) -> Vec<u64> {
         .resolve(ctx)
         .await
         .expect("pattern scan")
+        .into_iter()
+        .map(|node| *node.value)
+        .collect()
 }
 
 pub(super) async fn scan_tagged<T>(

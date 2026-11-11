@@ -16,7 +16,7 @@ impl_resolver_singleton!(all, StaticFindObjectFast, |ctx| async {
         .root_functions()
         .addresses()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });

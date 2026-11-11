@@ -122,9 +122,9 @@ impl_resolver_singleton!(all, FUObjectArrayAllocateUObjectIndex, |ctx| async {
         .root_functions()
         .addresses()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 /// public: void __cdecl FUObjectArray::FreeUObjectIndex(class UObjectBase *)
@@ -156,11 +156,11 @@ impl_resolver_singleton!(all, FUObjectArrayFreeUObjectIndex, |ctx| async {
     BinaryMatcher::candidates(refs)
         .root_functions()
         .addresses()
-        .filter(|address| address != allocate_uobject.0)
+        .filter(|address| *address.value != allocate_uobject.0)
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 /// void __cdecl UObjectBaseShutdown(void)
@@ -175,9 +175,9 @@ impl_resolver_singleton!(PEImage, UObjectBaseShutdown, |ctx| async {
         .root_functions()
         .addresses()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 impl_resolver_singleton!(ElfImage, UObjectBaseShutdown, |ctx| async {
@@ -190,7 +190,7 @@ impl_resolver_singleton!(ElfImage, UObjectBaseShutdown, |ctx| async {
         .root_functions()
         .addresses()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });

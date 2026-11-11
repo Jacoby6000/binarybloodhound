@@ -15,7 +15,7 @@ pub trait Cardinality: sealed::Sealed + Send + Sync + 'static {
     fn into_items<T: Send>(output: Self::Output<T>) -> Vec<T>;
 }
 
-/// Zero, one, or more candidates; resolves to Vec<T>.
+/// Zero, one, or more candidates; resolves to `Vec<T>`.
 #[derive(Debug, Clone, Copy)]
 pub struct Variable;
 

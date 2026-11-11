@@ -31,9 +31,9 @@ impl_resolver_singleton!(all, StaticLoadObjectPatterns, |ctx| async {
     BinaryMatcher::patterns(patterns)?
         .rip4()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 pub use super::models::objects::StaticLoadObjectString;
@@ -49,7 +49,7 @@ impl_resolver_singleton!(all, StaticLoadObjectString, |ctx| async {
     .root_functions()
     .addresses()
     .ensure_one()
-    .map(Self)
     .resolve(ctx)
     .await
+    .map(|node| Self(*node.value))
 });

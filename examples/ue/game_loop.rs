@@ -23,9 +23,9 @@ impl_resolver_singleton!(PEImage, Main, |ctx| async {
         .root_functions()
         .addresses()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 impl_resolver_singleton!(ElfImage, Main, |_ctx| async {
     bail_out!("ElfImage unimplemented");
@@ -58,17 +58,15 @@ impl_resolver_singleton!(PEImage, FEngineLoopTick, |ctx| async {
     .collect::<Result<Vec<_>, _>>()?;
 
     // Reuse the resolved primary candidates; do not rescan the anchor per branch.
-    let primary = BinaryMatcher::candidates(primary_fns);
-    let branches = secondary_fns.into_iter().map(|secondary| {
-        primary
-            .clone()
-            .intersect(BinaryMatcher::candidates(secondary))
-    });
+    let primary = Matcher::from_nodes(primary_fns);
+    let branches = secondary_fns
+        .into_iter()
+        .map(|secondary| primary.clone().intersect(Matcher::from_nodes(secondary)));
     Matcher::union_all(branches)
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 impl_resolver_singleton!(ElfImage, FEngineLoopTick, |_ctx| async {
     bail_out!("ElfImage unimplemented");
@@ -81,9 +79,9 @@ impl_resolver_singleton!(all, UGameEngineTick, |ctx| async {
         .root_functions()
         .addresses()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 /// int32_t FEngineLoop::Init(class FEngineLoop* this)
@@ -101,9 +99,9 @@ impl_resolver_singleton!(PEImage, FEngineLoopInit, |ctx| async {
         .root_functions()
         .addresses()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 impl_resolver_singleton!(ElfImage, FEngineLoopInit, |ctx| async {
@@ -117,9 +115,9 @@ impl_resolver_singleton!(ElfImage, FEngineLoopInit, |ctx| async {
         .root_functions()
         .addresses()
         .ensure_one()
-        .map(Self)
         .resolve(ctx)
         .await
+        .map(|node| Self(*node.value))
 });
 
 /// void UWorld::Tick(ELevelTick TickType, float DeltaSeconds)
