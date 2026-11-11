@@ -789,7 +789,7 @@ fn patterns_reject_invalid_signatures_at_construction_with_their_index() {
         .err()
         .expect("empty signature must fail");
     assert!(error.to_string().starts_with("invalid pattern at index 0:"));
-    assert!(format!("{error:#}").contains("pattern must contain at least one byte"));
+    assert!(format!("{error:#}").contains("pattern must match at least one byte"));
 }
 
 #[test]
@@ -1835,6 +1835,16 @@ fn function_traversal_accepts_an_empty_function_table() {
                 .is_empty()
         );
     }
+}
+
+#[test]
+fn root_functions_skip_addresses_outside_the_function_table() {
+    let matcher = BinaryMatcher::candidates([0, TEXT - 1, TEXT, TEXT + 127, TEXT + 128, u64::MAX])
+        .root_functions()
+        .addresses();
+    let result = run(&scan_image(), matcher).unwrap();
+
+    assert_eq!(result, [TEXT, TEXT + 64]);
 }
 
 #[test]

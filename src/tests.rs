@@ -37,6 +37,50 @@ mod pe {
             );
         }
     }
+
+    #[test]
+    fn root_functions_propagate_missing_function_table_memory() {
+        let image = scan_image().without_section(".pdata");
+        let error = run(&image, BinaryMatcher::address(TEXT).root_functions()).unwrap_err();
+
+        assert_eq!(
+            error,
+            ResolveError::from(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError)
+        );
+    }
+
+    #[test]
+    fn root_functions_reject_invalid_function_table_ranges() {
+        for (start, end) in [
+            (BASE + 0x2000, BASE + 0x2001),
+            (BASE + 0x2001, BASE + 0x2000),
+        ] {
+            let mut image = scan_image();
+            image.image_type =
+                patternsleuth::image::ImageType::PEImage(patternsleuth::image::pe::PEImage {
+                    exception_directory_range: start..end,
+                    exception_children_cache: Default::default(),
+                });
+            let error = run(&image, BinaryMatcher::address(TEXT).root_functions()).unwrap_err();
+
+            assert_eq!(
+                error,
+                ResolveError::from(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError)
+            );
+        }
+    }
+
+    #[test]
+    fn root_functions_reject_function_address_overflow() {
+        let mut image = scan_image();
+        image.base_address = u64::MAX;
+        let error = run(&image, BinaryMatcher::address(TEXT).root_functions()).unwrap_err();
+
+        assert_eq!(
+            error,
+            ResolveError::from(patternsleuth::MemoryAccessError::MemoryOutOfBoundsError)
+        );
+    }
 }
 
 #[cfg(feature = "image-elf")]

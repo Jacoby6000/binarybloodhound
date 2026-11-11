@@ -304,7 +304,7 @@ impl<'scope, I: Send + 'scope, T: HasAddress + Send + 'scope, C: Cardinality>
     /// Map to root-function metadata; skip unknown functions and propagate errors.
     pub fn root_functions(self) -> Matcher<'scope, I, FunctionEntry> {
         self.with_context().filter_modify(|(ctx, node)| {
-            let Some(function) = ctx.image().get_root_function(node.address())? else {
+            let Some(function) = root_function(ctx.image(), node.address())? else {
                 return Ok(None);
             };
             if function.range.end < function.range.start {
@@ -439,12 +439,48 @@ pub mod stages {
     }
 }
 
+fn root_function(
+    image: &patternsleuth::image::Image<'_>,
+    address: u64,
+) -> std::result::Result<Option<patternsleuth::RuntimeFunction>, patternsleuth::MemoryAccessError> {
+    match &image.image_type {
+        #[cfg(feature = "image-pe")]
+        patternsleuth::image::ImageType::PEImage(pe) => {
+            use patternsleuth::{MemoryAccessError, MemoryTrait};
+
+            let range = &pe.exception_directory_range;
+            let length = range
+                .end
+                .checked_sub(range.start)
+                .ok_or(MemoryAccessError::MemoryOutOfBoundsError)?;
+            if length == 0 {
+                return Ok(None);
+            }
+            if length < 12 {
+                return Err(MemoryAccessError::MemoryOutOfBoundsError);
+            }
+            let first = image
+                .base_address
+                .checked_add(u64::from(image.memory.u32_le(range.start)?))
+                .ok_or(MemoryAccessError::MemoryOutOfBoundsError)?;
+            // Upstream's inclusive binary search underflows for empty tables or
+            // addresses below the first entry in the sorted PE function table.
+            if address < first {
+                return Ok(None);
+            }
+        }
+        #[cfg(feature = "image-elf")]
+        patternsleuth::image::ImageType::ElfImage(_) => {}
+    }
+    image.get_root_function(address)
+}
+
 /// Visit reachable blocks without following branches outside the containing root.
 fn function_calls(ctx: MatchContext<'_, '_>, address: u64) -> Result<Vec<Call>> {
     use patternsleuth::MemoryTrait;
 
     let image = ctx.image();
-    let Some(root) = image.get_root_function(address)? else {
+    let Some(root) = root_function(image, address)? else {
         return Ok(Vec::new());
     };
     let entry = root.range.start;
@@ -458,7 +494,7 @@ fn function_calls(ctx: MatchContext<'_, '_>, address: u64) -> Result<Vec<Call>> 
     while let Some(block) = pending.pop() {
         if visited.contains(&block)
             || bounds.as_ref().is_some_and(|range| !range.contains(&block))
-            || image.get_root_function(block)?.map(|f| f.range.start) != Some(entry)
+            || root_function(image, block)?.map(|f| f.range.start) != Some(entry)
         {
             continue;
         }
@@ -471,7 +507,7 @@ fn function_calls(ctx: MatchContext<'_, '_>, address: u64) -> Result<Vec<Call>> 
         let mut decoder = Decoder::with_ip(64, &bytes[..length], block, DecoderOptions::NONE);
         while decoder.can_decode() {
             let ip = decoder.ip();
-            if image.get_root_function(ip)?.map(|f| f.range.start) != Some(entry)
+            if root_function(image, ip)?.map(|f| f.range.start) != Some(entry)
                 || !visited.insert(ip)
             {
                 break;
