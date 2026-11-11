@@ -21,11 +21,11 @@ impl_resolver_singleton!(PEImage, GEngine, |ctx| async {
                 if !(start..=reference_addr).contains(&ip) {
                     return Ok(Control::Break);
                 }
-                if ip == reference_addr && op0_reg == Register::R8 {
-                    return Ok(rcx.map_or(Control::Break, Control::Return));
-                }
-                match (op0_reg, inst.is_ip_rel_memory_operand()) {
-                    (Register::RCX, true) => Ok(Control::Continue((
+                match op0_reg {
+                    Register::R8 if ip == reference_addr => {
+                        Ok(rcx.map_or(Control::Break, Control::Return))
+                    }
+                    Register::RCX if inst.is_ip_rel_memory_operand() => Ok(Control::Continue((
                         reference_addr,
                         Some(start),
                         Some(inst.ip_rel_memory_address()),
