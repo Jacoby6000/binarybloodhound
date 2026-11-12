@@ -123,6 +123,45 @@ impl_resolver_singleton!(ElfImage, FEngineLoopInit, |ctx| async {
 /// void UWorld::Tick(ELevelTick TickType, float DeltaSeconds)
 pub use super::models::engine::UWorldTick;
 impl_resolver_singleton!(collect, UWorldTick);
+
+#[cfg(feature = "image-pe")]
+struct WorldTickCandidate {
+    anchors: HashSet<usize>,
+    size: u64,
+}
+
+#[cfg(feature = "image-pe")]
+fn select_world_tick(
+    candidates: HashMap<u64, WorldTickCandidate>,
+    n_specific: usize,
+) -> patternsleuth::resolvers::Result<u64> {
+    // Rank by specific anchors, total anchors, generic anchors, then span.
+    let mut ranked: Vec<_> = candidates
+        .into_iter()
+        .map(|(address, candidate)| {
+            let total = candidate.anchors.len();
+            let specific = candidate
+                .anchors
+                .iter()
+                .filter(|&&index| index < n_specific)
+                .count();
+            ((specific, total, total - specific, candidate.size), address)
+        })
+        .collect();
+    ranked.sort_by_key(|(score, _)| Reverse(*score));
+    let Some(&(score, address)) = ranked.first() else {
+        bail_out!("no UWorld::Tick anchor string referenced inside a function");
+    };
+    let (specific, total, _, size) = score;
+    if specific == 0 && (total < 2 || size < 0x800) {
+        bail_out!("only generic net anchors on a small fn");
+    }
+    if ranked.get(1).is_some_and(|(other, _)| *other == score) {
+        bail_out!("ambiguous UWorld::Tick candidates");
+    }
+    Ok(address)
+}
+
 impl_resolver_singleton!(PEImage, UWorldTick, |ctx| async {
     const UWORLD_TICK_SPECIFIC: &[&str] = &[
         "TickInGamePerfTrackersRT\0",
@@ -166,46 +205,111 @@ impl_resolver_singleton!(PEImage, UWorldTick, |ctx| async {
     )
     .await;
 
-    // bin each xref to its containing root function
-    let mut fn_anchors: HashMap<u64, HashSet<usize>> = HashMap::new();
-    let mut fn_size: HashMap<u64, u64> = HashMap::new();
+    let mut candidates = HashMap::new();
     for (idx, refs) in xref_results {
         for r in refs {
             if let Some(f) = ctx.image().get_root_function(r)? {
-                fn_anchors.entry(f.range.start).or_default().insert(idx);
-                fn_size
-                    .entry(f.range.start)
-                    .or_insert(f.range.end - f.range.start);
+                let candidate =
+                    candidates
+                        .entry(f.range.start)
+                        .or_insert_with(|| WorldTickCandidate {
+                            anchors: HashSet::new(),
+                            size: f.range.end - f.range.start,
+                        });
+                candidate.anchors.insert(idx);
             }
         }
     }
-    if fn_anchors.is_empty() {
-        bail_out!("no UWorld::Tick anchor string referenced inside a function");
-    }
-
-    // rank key: (#specific, #total, #generic, span), all descending.
-    let score = |fn_addr: &u64| {
-        let set = &fn_anchors[fn_addr];
-        let spec = set.iter().filter(|&&i| i < n_specific).count();
-        (spec, set.len(), set.len() - spec, fn_size[fn_addr])
-    };
-
-    let mut fns = fn_anchors.keys().copied().collect::<Vec<_>>();
-    fns.sort_by_key(|f| Reverse(score(f)));
-    let best = fns[0];
-    let (best_spec, best_total, _best_gen, best_size) = score(&best);
-
-    if best_spec == 0 && (best_total < 2 || best_size < 0x800) {
-        bail_out!("only generic net anchors on a small fn");
-    }
-
-    // require a strict winner
-    if fns.len() > 1 && score(&fns[1]) == score(&best) {
-        bail_out!("ambiguous UWorld::Tick candidates");
-    }
-
-    Ok(UWorldTick(best))
+    select_world_tick(candidates, n_specific).map(Self)
 });
 impl_resolver_singleton!(ElfImage, UWorldTick, |_ctx| async {
     bail_out!("ElfImage unimplemented");
 });
+
+#[cfg(all(test, feature = "image-pe"))]
+mod tests {
+    use super::{WorldTickCandidate, select_world_tick};
+
+    fn candidate(anchors: &[usize], size: u64) -> WorldTickCandidate {
+        WorldTickCandidate {
+            anchors: anchors.iter().copied().collect(),
+            size,
+        }
+    }
+
+    #[test]
+    fn world_tick_prefers_specific_anchors_over_generic_count_and_size() {
+        let candidates = [
+            (0x1000, candidate(&[0], 0x100)),
+            (0x2000, candidate(&[2, 3, 4], 0x1000)),
+        ]
+        .into();
+
+        assert_eq!(select_world_tick(candidates, 2).unwrap(), 0x1000);
+    }
+
+    #[test]
+    fn world_tick_ranks_total_anchors_before_function_size() {
+        let candidates = [
+            (0x1000, candidate(&[0, 2], 0x100)),
+            (0x2000, candidate(&[0], 0x1000)),
+        ]
+        .into();
+
+        assert_eq!(select_world_tick(candidates, 2).unwrap(), 0x1000);
+    }
+
+    #[test]
+    fn world_tick_uses_size_to_break_equal_anchor_scores() {
+        let candidates = [
+            (0x1000, candidate(&[0], 0x100)),
+            (0x2000, candidate(&[0], 0x200)),
+        ]
+        .into();
+
+        assert_eq!(select_world_tick(candidates, 2).unwrap(), 0x2000);
+    }
+
+    #[test]
+    fn world_tick_accepts_generic_anchors_only_at_both_thresholds() {
+        for (anchors, size, accepted) in [
+            (&[2, 3][..], 0x800, true),
+            (&[2, 3], 0x7ff, false),
+            (&[2], 0x1000, false),
+        ] {
+            let candidates = [(0x1000, candidate(anchors, size))].into();
+            let result = select_world_tick(candidates, 2);
+
+            if accepted {
+                assert_eq!(result.unwrap(), 0x1000);
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "only generic net anchors on a small fn"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn world_tick_rejects_equal_best_scores() {
+        let candidates = [
+            (0x1000, candidate(&[0], 0x100)),
+            (0x2000, candidate(&[1], 0x100)),
+        ]
+        .into();
+        let error = select_world_tick(candidates, 2).unwrap_err();
+
+        assert_eq!(error.to_string(), "ambiguous UWorld::Tick candidates");
+    }
+
+    #[test]
+    fn world_tick_rejects_missing_candidates() {
+        let error = select_world_tick(Default::default(), 2).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "no UWorld::Tick anchor string referenced inside a function"
+        );
+    }
+}
