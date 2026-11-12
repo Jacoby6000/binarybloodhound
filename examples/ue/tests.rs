@@ -897,6 +897,138 @@ fn fname_pool_legacy_getter_matches_upstream() {
     }
 }
 
+fn fname_pool_image(bytes: Vec<u8>) -> Image<'static> {
+    #[cfg(feature = "image-pe")]
+    let image = pe_image(bytes);
+    #[cfg(all(feature = "image-elf", not(feature = "image-pe")))]
+    let image = {
+        let image = image(bytes);
+        Image::from_memory(
+            0x1000,
+            image.memory,
+            ImageType::ElfImage(patternsleuth::image::elf::ElfImage {
+                functions: Some(vec![0x1000..0x1040, 0x1040..0x1080]),
+            }),
+        )
+    };
+    image
+}
+
+fn fname_pool_bytes(property_strings: bool) -> Vec<u8> {
+    let mut bytes = vec![0x90; 0x800];
+    if property_strings {
+        for (index, text) in [
+            "\0ByteProperty\0",
+            "\0IntProperty\0",
+            "\0BoolProperty\0",
+            "\0FloatProperty\0",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let offset = 0x400 + index * 0x40;
+            bytes[offset..offset + text.len()].copy_from_slice(text.as_bytes());
+            relative(
+                &mut bytes,
+                0x10 + index * 7,
+                &[0x48, 0x8d, 0x0d],
+                0x1001 + offset as u64,
+            );
+        }
+    } else {
+        write_pattern(&mut bytes, 0x10, "48 89 41 08 41 b8 00 00 01 00", &[]);
+        relative(&mut bytes, 0x50, &[0xe8], 0x1000);
+    }
+    bytes
+}
+
+fn write_fname_pool_match(
+    bytes: &mut [u8],
+    offset: usize,
+    pool: u64,
+    constructor: u64,
+    extra: bool,
+) {
+    let signature = if extra {
+        "48 8d 0d [ ?? ?? ?? ?? ] e8 [ ?? ?? ?? ?? ] 90 90 90 c6 05 ?? ?? ?? ?? 01"
+    } else {
+        "48 8d 0d [ ?? ?? ?? ?? ] e8 [ ?? ?? ?? ?? ] c6 05 ?? ?? ?? ?? 01"
+    };
+    write_pattern(bytes, offset, signature, &[pool, constructor]);
+}
+
+#[test]
+fn fname_pool_capture_pipeline_matches_bodies_callers_and_property_intersections() {
+    for (strings, constructor) in [(false, 0x1000), (false, 0x1040), (true, 0x1000)] {
+        for extra in [false, true] {
+            let mut bytes = fname_pool_bytes(strings);
+            if extra && !strings {
+                bytes[0x50] = 0xe9;
+            }
+            write_fname_pool_match(&mut bytes, 0x100, 0x4000, constructor, extra);
+            write_fname_pool_match(&mut bytes, 0x180, 0x4000, constructor, !extra);
+            write_fname_pool_match(&mut bytes, 0x200, 0x5000, 0x2000, extra);
+            let image = fname_pool_image(bytes);
+            let result = image.resolve(models::fname::FNamePool::resolver()).unwrap();
+            let upstream = image
+                .resolve(patternsleuth::resolvers::unreal::fname::FNamePool::resolver())
+                .unwrap();
+
+            assert_eq!(result.0, 0x4000);
+            assert_eq!(result.0, upstream.0);
+        }
+    }
+}
+
+#[test]
+fn fname_pool_capture_pipeline_preserves_modern_priority_and_legacy_fallback() {
+    for (constructor, second_pool, expected) in [
+        (0x1000, 0x4000, 0x4000),
+        (0x1000, 0x5000, 0x6000),
+        (0x2000, 0x4000, 0x6000),
+    ] {
+        let mut bytes = fname_pool_bytes(false);
+        write_fname_pool_match(&mut bytes, 0x100, 0x4000, constructor, false);
+        write_fname_pool_match(&mut bytes, 0x180, second_pool, constructor, true);
+        write_pattern(
+            &mut bytes,
+            0x300,
+            "48 83 EC 28 48 8B 05 [ ?? ?? ?? ?? ] 48 85 C0 75 01 B9 08 04 00 00",
+            &[0x6000],
+        );
+        let image = fname_pool_image(bytes);
+        let result = image.resolve(models::fname::FNamePool::resolver()).unwrap();
+        let upstream = image
+            .resolve(patternsleuth::resolvers::unreal::fname::FNamePool::resolver())
+            .unwrap();
+
+        assert_eq!(result.0, expected);
+        assert_eq!(result.0, upstream.0);
+    }
+}
+
+#[test]
+fn fname_pool_capture_pipeline_requires_every_property_reference_in_one_function() {
+    for split in [false, true] {
+        let mut bytes = fname_pool_bytes(true);
+        if split {
+            // Move the fourth reference into a different function.
+            bytes[0x25..0x2c].fill(0x90);
+            relative(&mut bytes, 0x50, &[0x48, 0x8d, 0x0d], 0x14c1);
+        } else {
+            bytes[0x10..0x17].fill(0x90);
+        }
+        write_fname_pool_match(&mut bytes, 0x100, 0x4000, 0x1000, false);
+        let image = fname_pool_image(bytes);
+        let result = image.resolve(models::fname::FNamePool::resolver());
+        let upstream =
+            image.resolve(patternsleuth::resolvers::unreal::fname::FNamePool::resolver());
+
+        assert!(result.is_err());
+        assert!(upstream.is_err());
+    }
+}
+
 #[test]
 #[cfg(feature = "image-elf")]
 fn fname_to_string_elf_matches_upstream_call_target() {

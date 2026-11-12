@@ -2,8 +2,8 @@
 
 use futures::future::join_all;
 
-use super::scan::{scan, scan_tagged};
-use binary_bloodhound::BinaryMatcher;
+use super::scan::scan;
+use binary_bloodhound::{BinaryMatcher, Matcher};
 use patternsleuth::scanner::Pattern;
 
 use super::util;
@@ -11,11 +11,8 @@ use super::util;
 use patternsleuth::MemoryTrait;
 use patternsleuth::resolvers::ResolveError;
 #[cfg(feature = "image-pe")]
-use patternsleuth::resolvers::try_ensure_one;
-use patternsleuth::{
-    Addressable,
-    resolvers::{Result, ensure_one, impl_resolver_singleton},
-};
+use patternsleuth::resolvers::{Result, try_ensure_one};
+use patternsleuth::resolvers::{ensure_one, impl_resolver_singleton};
 
 /// public: __cdecl FName::FName(wchar_t const *, enum EFindName)
 pub use super::models::fname::FNameCtorWchar;
@@ -320,60 +317,49 @@ impl_resolver_singleton!(all, FNamePool, |ctx| async {
     // post-4.23 FNamePool::FNamePool
     let post = async {
         let body = async {
-            let body_matches: Vec<u64> = join_all([
-                scan(ctx, Pattern::new("4? 89 ?? 08 41 b8 00 00 01 00").unwrap()),
-                scan(ctx, Pattern::new("4? 8d 4? 08 41 b8 08 00 01 00").unwrap()),
-            ])
-            .await
+            let body_fns: HashSet<u64> = BinaryMatcher::patterns([
+                "4? 89 ?? 08 41 b8 00 00 01 00",
+                "4? 8d 4? 08 41 b8 08 00 01 00",
+            ])?
+            .root_functions()
+            .addresses()
+            .resolve(ctx)
+            .await?
             .into_iter()
-            .flatten()
+            .map(|node| *node.value)
             .collect();
-            let body_fns: HashSet<u64> = util::root_functions(ctx, &body_matches)?
-                .into_iter()
-                .collect();
+            let caller_fns =
+                BinaryMatcher::candidates(body_fns.iter().copied().collect::<Vec<_>>())
+                    .callers()
+                    .root_functions()
+                    .addresses()
+                    .resolve(ctx)
+                    .await?
+                    .into_iter()
+                    .map(|node| *node.value);
 
-            let caller_sites: Vec<u64> = join_all(body_fns.iter().flat_map(|f| {
-                [
-                    scan(ctx, Pattern::new(format!("e8 X0x{f:X}")).unwrap()),
-                    scan(ctx, Pattern::new(format!("e9 X0x{f:X}")).unwrap()),
-                ]
-            }))
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
-            let caller_fns: HashSet<u64> = util::root_functions(ctx, &caller_sites)?
-                .into_iter()
-                .collect();
-
-            Ok::<HashSet<u64>, ResolveError>(body_fns.union(&caller_fns).copied().collect())
+            Ok::<HashSet<u64>, ResolveError>(body_fns.into_iter().chain(caller_fns).collect())
         };
 
         let strings = async {
-            let strs = [
-                "\0ByteProperty\0",
-                "\0IntProperty\0",
-                "\0BoolProperty\0",
-                "\0FloatProperty\0",
-            ];
-            let str_addrs: Vec<Vec<u64>> =
-                join_all(strs.iter().map(|s| scan(ctx, util::utf8_pattern(s))))
-                    .await
-                    .into_iter()
-                    .map(|matches| matches.into_iter().map(|a| a + 1).collect())
-                    .collect();
-            let xrefs: Vec<Vec<u64>> =
-                join_all(str_addrs.iter().map(|addrs| util::scan_xrefs(ctx, addrs))).await;
-            let fn_groups: Vec<HashSet<u64>> = xrefs
-                .iter()
-                .map(|rs| util::root_functions(ctx, rs).map(|fs| fs.into_iter().collect()))
-                .collect::<Result<_>>()?;
-            Ok::<HashSet<u64>, ResolveError>(
-                fn_groups
-                    .into_iter()
-                    .reduce(|a, b| a.intersection(&b).copied().collect())
-                    .unwrap_or_default(),
+            let nodes = Matcher::intersect_all(
+                [
+                    "\0ByteProperty\0",
+                    "\0IntProperty\0",
+                    "\0BoolProperty\0",
+                    "\0FloatProperty\0",
+                ]
+                .map(|text| {
+                    BinaryMatcher::pattern(util::utf8_pattern(text))
+                        .offset(1)
+                        .references()
+                        .root_functions()
+                        .addresses()
+                }),
             )
+            .resolve(ctx)
+            .await?;
+            Ok::<HashSet<u64>, ResolveError>(nodes.into_iter().map(|node| *node.value).collect())
         };
 
         let (body_set, str_set) = join!(body, strings);
@@ -384,25 +370,19 @@ impl_resolver_singleton!(all, FNamePool, |ctx| async {
             "48 8d 0d [ ?? ?? ?? ?? ] e8 [ ?? ?? ?? ?? ] c6 05 ?? ?? ?? ?? 01",
             "48 8d 0d [ ?? ?? ?? ?? ] e8 [ ?? ?? ?? ?? ] ?? ?? ?? c6 05 ?? ?? ?? ?? 01",
         ];
-        let pool_matches = join_all(
-            shapes
-                .iter()
-                .map(|s| scan_tagged(ctx, (), Pattern::new(s).unwrap())),
-        )
-        .await;
-
-        let mut pool_addrs: HashSet<u64> = HashSet::new();
-        for (_, pattern, addresses) in &pool_matches {
-            for a in addresses {
-                let Some(caps) = ctx.image().memory.captures(pattern, *a)? else {
-                    continue;
-                };
-                if candidates.contains(&caps[1].rip()) {
-                    pool_addrs.insert(caps[0].rip());
+        BinaryMatcher::capture_patterns(shapes)?
+            .try_map_filter(|node| {
+                let caps = &node.captures;
+                if candidates.contains(&caps[1].rip4()?) {
+                    Ok(Some(caps[0].rip4()?))
+                } else {
+                    Ok(None)
                 }
-            }
-        }
-        ensure_one(pool_addrs)
+            })
+            .ensure_one()
+            .resolve(ctx)
+            .await
+            .map(|node| *node.value)
     };
 
     // pre-4.23 GNames getter
