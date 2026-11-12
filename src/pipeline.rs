@@ -74,7 +74,7 @@ where
         Trace<T, Composition<C::Output<Trace<O, P>>, Q>>: 'ctx,
     {
         Box::pin(async move {
-            let parent = Arc::new(C::finish(self.first.run_in(input, ctx).await?)?);
+            let parent = Arc::new(self.first.run_resolved_in(input, ctx).await?);
             let children = self.next.run_in((*parent).clone(), ctx).await?;
             Ok(children
                 .into_iter()
@@ -124,15 +124,20 @@ where
         ForkTrace<Trace<O, P>, Trace<T, Q>, C, D>: 'ctx,
     {
         Box::pin(async move {
-            let left = C::finish(self.left.run_in(input.clone(), ctx).await?)?;
-            let right = D::finish(self.right.run_in(input, ctx).await?)?;
+            let left = self.left.run_resolved_in(input.clone(), ctx).await?;
+            let right = self.right.run_resolved_in(input, ctx).await?;
             Ok(vec![Trace::joined((left, right))])
         })
     }
 }
 
 pub(crate) fn merge_items<T: PartialEq, P>(nodes: Vec<Trace<T, P>>) -> Vec<Trace<T, P>> {
-    let mut result: Vec<Trace<T, P>> = Vec::new();
+    let mut result = Vec::new();
+    merge_into(&mut result, nodes);
+    result
+}
+
+fn merge_into<T: PartialEq, P>(result: &mut Vec<Trace<T, P>>, nodes: Vec<Trace<T, P>>) {
     for node in nodes {
         if let Some(previous) = result
             .iter_mut()
@@ -143,7 +148,6 @@ pub(crate) fn merge_items<T: PartialEq, P>(nodes: Vec<Trace<T, P>>) -> Vec<Trace
             result.push(node);
         }
     }
-    result
 }
 
 enum SetOperation {
@@ -170,8 +174,9 @@ impl<'scope, I: Clone + Send + 'scope, T: PartialEq + Send + Sync + 'scope, P: S
         Box::pin(async move {
             let mut result: Vec<Trace<T, P>> = Vec::new();
             for (index, matcher) in self.matchers.iter().enumerate() {
-                let mut nodes = merge_items(matcher.run_in(input.clone(), ctx).await?);
+                let nodes = matcher.run_in(input.clone(), ctx).await?;
                 if matches!(self.operation, SetOperation::Intersect) && index > 0 {
+                    let mut nodes = merge_items(nodes);
                     result = result
                         .into_iter()
                         .filter_map(|mut node| {
@@ -182,8 +187,7 @@ impl<'scope, I: Clone + Send + 'scope, T: PartialEq + Send + Sync + 'scope, P: S
                         })
                         .collect();
                 } else {
-                    result.extend(nodes);
-                    result = merge_items(result);
+                    merge_into(&mut result, nodes);
                 }
             }
             Ok(result)
@@ -289,7 +293,14 @@ impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope,
         self.run.run(input, ctx).await
     }
     pub async fn run(&self, input: I, ctx: &AsyncContext<'_>) -> Result<C::Output<Trace<O, P>>> {
-        C::finish(self.run_in(input, MatchContext::new(ctx)).await?)
+        self.run_resolved_in(input, MatchContext::new(ctx)).await
+    }
+    pub(crate) async fn run_resolved_in(
+        &self,
+        input: I,
+        ctx: MatchContext<'_, '_>,
+    ) -> Result<Resolved<O, P, C>> {
+        C::finish(self.run_in(input, ctx).await?)
     }
     pub fn into_variable(self) -> Matcher<'scope, I, O, Variable, P> {
         Matcher {

@@ -75,6 +75,16 @@ impl<T, P> Trace<T, P> {
         }
     }
 
+    pub(crate) fn children(
+        values: impl IntoIterator<Item = T>,
+        parent: P,
+    ) -> impl Iterator<Item = Self> {
+        let parent = Arc::new(parent);
+        values
+            .into_iter()
+            .map(move |value| Self::child(value, Arc::clone(&parent)))
+    }
+
     /// First contributing parent; parents() includes every merged derivation.
     /// This never returns an arbitrary last contributor or discards other paths.
     pub fn parent(&self) -> &P {

@@ -155,19 +155,18 @@ impl<
         Box::pin(async move {
             let mut result = Vec::new();
             for node in self.matcher.run_in(input, ctx).await? {
+                let address = node.address();
                 let calls_only = matches!(self.kind, ReferenceKind::Calls);
-                let mut addresses = ctx.references(&[node.address()], calls_only).await;
+                let mut addresses = ctx.references(&[address], calls_only).await;
                 if matches!(self.kind, ReferenceKind::Both) {
-                    addresses.extend(ctx.references(&[node.address()], true).await);
+                    addresses.extend(ctx.references(&[address], true).await);
                     let mut seen = std::collections::HashSet::new();
                     addresses.retain(|address| seen.insert(*address));
                 }
-                let parent = Arc::new(node);
-                result.extend(
-                    addresses
-                        .into_iter()
-                        .map(|address| Trace::child(InstructionSite(address), Arc::clone(&parent))),
-                );
+                result.extend(Trace::children(
+                    addresses.into_iter().map(InstructionSite),
+                    node,
+                ));
             }
             Ok(result)
         })
@@ -200,17 +199,10 @@ impl<
         Box::pin(async move {
             let mut result = Vec::new();
             for function in self.functions.run_in(input, ctx).await? {
-                let value = &function.value;
-                if value.end < value.start {
-                    return Err(ResolveError::new_msg(format!(
-                        "invalid function range: {:#x}..{:#x}",
-                        value.start, value.end
-                    )));
-                }
-                let inner = ctx.within(value.start..value.end);
+                let inner = ctx.within(function.checked_range()?);
                 if inner.bounds().is_some_and(|range| range.start < range.end) {
                     let parent = Arc::new(function);
-                    let nodes = D::into_items(D::finish(self.inner.run_in((), inner).await?)?);
+                    let nodes = D::into_items(self.inner.run_resolved_in((), inner).await?);
                     result.extend(
                         nodes
                             .into_iter()

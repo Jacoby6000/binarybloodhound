@@ -32,12 +32,7 @@ pub(crate) fn walk<S: Clone, R>(
 ) -> Result<Vec<R>> {
     use patternsleuth::disassemble::{Control as NativeControl, disassemble};
 
-    if function.end < function.start {
-        return Err(ResolveError::new_msg(format!(
-            "invalid function range: {:#x}..{:#x}",
-            function.start, function.end
-        )));
-    }
+    function.checked_range()?;
     let bounds = ctx.bounds();
     let start = bounds
         .as_ref()
@@ -141,13 +136,7 @@ pub(crate) fn collect(
     function: FunctionEntry,
     stop: &impl Fn(&Instruction) -> bool,
 ) -> Result<Vec<Instruction>> {
-    if function.end < function.start {
-        return Err(ResolveError::new_msg(format!(
-            "invalid function range: {:#x}..{:#x}",
-            function.start, function.end
-        )));
-    }
-    let bounds = ctx.within(function.start..function.end).bounds().unwrap();
+    let bounds = ctx.within(function.checked_range()?).bounds().unwrap();
     let mut pending = vec![bounds.start];
     let mut visited = HashSet::new();
     let mut instructions = Vec::new();

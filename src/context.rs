@@ -41,7 +41,7 @@ where
             for node in self.matcher.run_in(input, ctx).await? {
                 let parent = Arc::new(node);
                 let matcher = (self.func)((ctx, &parent))?;
-                let nodes = D::into_items(D::finish(matcher.run_in((), ctx).await?)?);
+                let nodes = D::into_items(matcher.run_resolved_in((), ctx).await?);
                 result.extend(
                     nodes
                         .into_iter()
@@ -139,12 +139,7 @@ impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope,
             let mut result = Vec::new();
             for node in nodes {
                 let values = func((ctx, &node))?;
-                let parent = Arc::new(node);
-                result.extend(
-                    values
-                        .into_iter()
-                        .map(|value| Trace::child(value, Arc::clone(&parent))),
-                );
+                result.extend(Trace::children(values, node));
             }
             Ok(result)
         })
@@ -218,11 +213,7 @@ impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope,
     {
         self.matcher.transform_nodes(move |(ctx, nodes)| {
             let values = func((ctx, &nodes))?;
-            let parent = Arc::new(nodes);
-            Ok(values
-                .into_iter()
-                .map(|value| Trace::child(value, Arc::clone(&parent)))
-                .collect())
+            Ok(Trace::children(values, nodes).collect())
         })
     }
     pub fn flat_map<U, Q, D, F>(

@@ -13,17 +13,13 @@ pub(super) fn root_entry(image: &Image<'_>, address: u64) -> Result<Option<Funct
     let Some(function) = root_function(image, address)? else {
         return Ok(None);
     };
-    if function.range.end < function.range.start {
-        return Err(ResolveError::new_msg(format!(
-            "invalid function range: {:#x}..{:#x}",
-            function.range.start, function.range.end
-        )));
-    }
-    Ok(Some(FunctionEntry {
+    let entry = FunctionEntry {
         start: function.range.start,
         end: function.range.end,
         unwind: (function.unwind != 0).then_some(function.unwind),
-    }))
+    };
+    entry.checked_range()?;
+    Ok(Some(entry))
 }
 
 fn root_function(
