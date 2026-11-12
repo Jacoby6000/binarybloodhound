@@ -1,57 +1,8 @@
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
 use patternsleuth::resolvers::Result;
 
-use crate::{
-    Cardinality, Composition, ExactlyOne, MatchContext, Matcher, Trace, Variable, pipeline::Run,
-};
-
-struct FlatMap<'scope, I, O, P, C: Cardinality, F> {
-    matcher: Matcher<'scope, I, O, C, P>,
-    func: F,
-}
-impl<
-    'scope,
-    I: Send + 'scope,
-    O: Send + Sync + 'scope,
-    P: Send + Sync + 'scope,
-    U: Send + Sync + 'scope,
-    Q: Send + Sync + 'scope,
-    C: Cardinality,
-    D: Cardinality,
-    F,
-> Run<I, Trace<U, Composition<Trace<O, P>, Q>>> for FlatMap<'scope, I, O, P, C, F>
-where
-    F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<Matcher<'scope, (), U, D, Q>>
-        + Send
-        + Sync,
-{
-    fn run<'ctx, 'image>(
-        &'ctx self,
-        input: I,
-        ctx: MatchContext<'ctx, 'image>,
-    ) -> BoxFuture<'ctx, Result<Vec<Trace<U, Composition<Trace<O, P>, Q>>>>>
-    where
-        I: 'ctx,
-        Trace<U, Composition<Trace<O, P>, Q>>: 'ctx,
-    {
-        Box::pin(async move {
-            let mut result = Vec::new();
-            for node in self.matcher.run_in(input, ctx).await? {
-                let parent = Arc::new(node);
-                let matcher = (self.func)((ctx, &parent))?;
-                let nodes = D::into_items(matcher.run_resolved_in((), ctx).await?);
-                result.extend(
-                    nodes
-                        .into_iter()
-                        .map(|node| node.compose(Arc::clone(&parent))),
-                );
-            }
-            Ok(result)
-        })
-    }
-}
+use crate::{Cardinality, ExactlyOne, MatchContext, Matcher, Trace, Variable};
 
 /// One-shot context adapter; callbacks still borrow immutable candidates.
 #[must_use = "with_context applies only when followed by a transformation"]
@@ -214,39 +165,6 @@ impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope,
         self.matcher.transform_nodes(move |(ctx, nodes)| {
             let values = func((ctx, &nodes))?;
             Ok(Trace::children(values, nodes).collect())
-        })
-    }
-    pub fn flat_map<U, Q, D, F>(
-        self,
-        func: F,
-    ) -> Matcher<'scope, I, U, Variable, Composition<Trace<O, P>, Q>>
-    where
-        U: Send + Sync + 'scope,
-        Q: Send + Sync + 'scope,
-        D: Cardinality,
-        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Matcher<'scope, (), U, D, Q>
-            + Send
-            + Sync
-            + 'scope,
-    {
-        self.try_flat_map(move |input| Ok(func(input)))
-    }
-    pub fn try_flat_map<U, Q, D, F>(
-        self,
-        func: F,
-    ) -> Matcher<'scope, I, U, Variable, Composition<Trace<O, P>, Q>>
-    where
-        U: Send + Sync + 'scope,
-        Q: Send + Sync + 'scope,
-        D: Cardinality,
-        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<Matcher<'scope, (), U, D, Q>>
-            + Send
-            + Sync
-            + 'scope,
-    {
-        Matcher::from_run(FlatMap {
-            matcher: self.matcher,
-            func,
         })
     }
 }

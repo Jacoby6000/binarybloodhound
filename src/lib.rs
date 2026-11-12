@@ -23,6 +23,7 @@
 //! ```
 
 mod cardinality;
+mod composition;
 mod context;
 mod disassembly;
 mod evaluation;
@@ -35,12 +36,13 @@ mod sets;
 mod sources;
 
 pub use cardinality::{Cardinality, ExactlyOne, Variable};
+pub use composition::{ForkMatcher, ForkOutput, SequenceParents};
 pub use context::WithContext;
 pub use disassembly::Control;
 pub use evaluation::MatchContext;
 pub use navigation::stages;
 pub use nodes::{Address, Call, FunctionEntry, HasAddress, InstructionSite};
-pub use pipeline::{ForkMatcher, ForkOutput, Matcher, Resolved, SequenceParents};
+pub use pipeline::{Matcher, Resolved};
 pub use provenance::{Composition, Contributor, Function, Reference, Trace};
 pub use sources::IntoPattern;
 
