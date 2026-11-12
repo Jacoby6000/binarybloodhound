@@ -46,6 +46,7 @@ impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope,
         self.try_expand_values(func)
     }
 
+    /// Context-aware [`Matcher::find_map`]; only this callback short-circuits.
     pub fn find_map<U: Send + Sync + 'scope, F>(
         self,
         func: F,
@@ -56,6 +57,7 @@ impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope,
         self.try_find_map(move |input| Ok(func(input)))
     }
 
+    /// Context-aware [`Matcher::try_find_map`]; upstream stages still finish first.
     pub fn try_find_map<U: Send + Sync + 'scope, F>(
         self,
         func: F,

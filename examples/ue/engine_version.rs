@@ -4,11 +4,10 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use binary_bloodhound::{BinaryMatcher, ExactlyOne, Matcher, Trace, Variable};
 use itertools::Itertools;
-use patternsleuth::scanner::Pattern;
 
 use super::util;
 use patternsleuth::{
-    Addressable as _, MemoryTrait,
+    MemoryTrait,
     resolvers::{ResolveError, Result, bail_out, impl_resolver, impl_resolver_singleton},
 };
 
@@ -317,28 +316,25 @@ impl_resolver!(PEImage, EngineVersionStrings, |ctx| async {
     .map(|month| month.encode_utf16().flat_map(u16::to_le_bytes).collect())
     .collect::<HashSet<Vec<u8>>>();
 
-    let pattern = Pattern::new(patterns[0]).unwrap();
-    BinaryMatcher::pattern(pattern.clone())
+    BinaryMatcher::capture_patterns(patterns)?
         .with_context()
-        .try_transform(move |(ctx, nodes)| {
+        .try_find_map(move |(ctx, node)| {
             let mem = &ctx.image().memory;
-            for node in nodes {
-                let caps = mem.captures(&pattern, *node.value)?.unwrap();
-                let date = caps[1].rip();
-                if mem
-                    .range(date..date + 6)
-                    .ok()
-                    .filter(|r| months.contains(&r[..]))
-                    .is_some()
-                {
-                    return Ok(EngineVersionStrings {
-                        branch_name: mem.read_wstring(caps[0].rip())?,
-                        build_date: mem.read_wstring(caps[1].rip())?,
-                        build_version: mem.read_wstring(caps[2].rip())?,
-                    });
-                }
+            let caps = &node.captures;
+            let date = caps[1].rip4()?;
+            if mem
+                .range(date..date + 6)
+                .ok()
+                .filter(|r| months.contains(&r[..]))
+                .is_some()
+            {
+                return Ok(Some(EngineVersionStrings {
+                    branch_name: mem.read_wstring(caps[0].rip4()?)?,
+                    build_date: mem.read_wstring(date)?,
+                    build_version: mem.read_wstring(caps[2].rip4()?)?,
+                }));
             }
-            bail_out!("not found");
+            Ok(None)
         })
         .resolve(ctx)
         .await
@@ -385,77 +381,31 @@ impl_resolver!(all, StaticCustomVersions, |ctx| async {
         (V::F, "0f 10 05 [ ?? ?? ?? ?? ] 41 b8 01 00 00 00 48 8d 15 [ ?? ?? ?? ?? ] 48 8d 4c 24 40 0f 29 44 24 20 e8 ?? ?? ?? ?? 41 b8 [ ?? ?? ?? ?? ] 48"),
         (V::G, "0f 10 05 [ ?? ?? ?? ?? ] 41 b8 01 00 00 00 48 8d 15 [ ?? ?? ?? ?? ] 48 8d 4c 24 40 0f 29 44 24 20 e8 ?? ?? ?? ?? 45 33 c0 48 ?? ?? ?? ?? 48"),
     ];
-    let patterns = patterns
-        .into_iter()
-        .map(|(variant, signature)| (variant, Pattern::new(signature).unwrap()))
-        .collect();
-    Matcher::items::<(V, Pattern)>()
-        .flat_map(|source| BinaryMatcher::pattern(source.value.1.clone()))
+    BinaryMatcher::tagged_capture_patterns(patterns)?
         .ensure_non_empty()
         .with_context()
         .try_transform(|(ctx, nodes)| {
             let mut versions = BTreeSet::new();
             let mem = &ctx.image().memory;
             for node in nodes {
-                let (v, pattern) = node.parent().outer.value.as_ref();
-                let caps = mem.captures(pattern, *node.value)?.unwrap();
-
-                match v {
-                    V::A => {
-                        versions.insert(CustomVersion {
-                            guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
-                            version: caps[2].data[0] as u32,
-                            name: mem.read_wstring(caps[1].rip())?,
-                        });
-                    }
-                    V::B => {
-                        versions.insert(CustomVersion {
-                            guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
-                            version: 0,
-                            name: mem.read_wstring(caps[1].rip())?,
-                        });
-                    }
-                    V::C => {
-                        versions.insert(CustomVersion {
-                            guid: Guid(mem.array(caps[1].rip()).unwrap_or_default()),
-                            version: 0,
-                            name: mem.read_wstring(caps[0].rip())?,
-                        });
-                    }
-                    V::D => {
-                        versions.insert(CustomVersion {
-                            guid: Guid(mem.array(caps[1].rip()).unwrap_or_default()),
-                            version: caps[2].u32(),
-                            name: mem.read_wstring(caps[0].rip())?,
-                        });
-                    }
-                    V::E => {
-                        versions.insert(CustomVersion {
-                            guid: Guid(mem.array(caps[1].rip()).unwrap_or_default()),
-                            version: 0,
-                            name: mem.read_wstring(caps[0].rip())?,
-                        });
-                    }
-                    V::F => {
-                        versions.insert(CustomVersion {
-                            guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
-                            version: caps[2].u32(),
-                            name: mem.read_wstring(caps[1].rip())?,
-                        });
-                    }
-                    V::G => {
-                        versions.insert(CustomVersion {
-                            guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
-                            version: 0,
-                            name: mem.read_wstring(caps[1].rip())?,
-                        });
-                    }
-                }
+                let caps = &node.captures;
+                let (guid, name, version) = match node.tag.as_ref() {
+                    V::A => (0, 1, u32::from(caps[2].data[0])),
+                    V::B | V::G => (0, 1, 0),
+                    V::C | V::E => (1, 0, 0),
+                    V::D => (1, 0, caps[2].u32()?),
+                    V::F => (0, 1, caps[2].u32()?),
+                };
+                versions.insert(CustomVersion {
+                    guid: Guid(mem.array(caps[guid].rip4()?).unwrap_or_default()),
+                    version,
+                    name: mem.read_wstring(caps[name].rip4()?)?,
+                });
             }
 
             Ok(Self(versions))
         })
-        .run(patterns, ctx)
+        .resolve(ctx)
         .await
         .and_then(into_value)
 });
@@ -483,23 +433,17 @@ impl_resolver!(all, BuildChangeList, |ctx| async {
         })
         .flat_map(move |anchors| {
             let anchors = Arc::clone(&anchors.value);
-            Matcher::from_sync(move |()| {
-                Ok(patterns
-                    .map(|signature| Pattern::new(signature).unwrap())
-                    .to_vec())
-            })
-            .flat_map(|source| BinaryMatcher::pattern(source.value.as_ref().clone()))
-            .with_context()
-            .try_transform(move |(ctx, nodes)| {
-                let mem = &ctx.image().memory;
-                let img = ctx.image();
-                for node in nodes {
-                    let pattern = node.parent().outer.value.as_ref();
-                    let caps = mem.captures(pattern, *node.value)?.unwrap();
+            BinaryMatcher::capture_patterns(patterns)
+                .expect("valid build changelist patterns")
+                .with_context()
+                .try_find_map(move |(ctx, node)| {
+                    let mem = &ctx.image().memory;
+                    let img = ctx.image();
+                    let caps = &node.captures;
 
                     // Check if caps[1] (the lea rdx offset) points to a "Build: %s" string
-                    if anchors.contains(&caps[1].rip()) {
-                        let call_target = caps[0].rip();
+                    if anchors.contains(&caps[1].rip4()?) {
+                        let call_target = caps[0].rip4()?;
                         let mut result: Option<String> = None;
                         let mut num_inst = 0;
 
@@ -524,12 +468,11 @@ impl_resolver!(all, BuildChangeList, |ctx| async {
                         })?;
 
                         if let Some(s) = result {
-                            return Ok(BuildChangeList(s));
+                            return Ok(Some(BuildChangeList(s)));
                         }
                     }
-                }
-                bail_out!("Build changelist not found");
-            })
+                    Ok(None)
+                })
         })
         .first()
         .resolve(ctx)
