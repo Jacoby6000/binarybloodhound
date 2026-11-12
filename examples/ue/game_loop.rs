@@ -3,7 +3,6 @@
 use binary_bloodhound::BinaryMatcher;
 #[cfg(feature = "image-pe")]
 use {
-    super::scan::scan_tagged,
     binary_bloodhound::Matcher,
     futures::future::join_all,
     std::{
@@ -187,40 +186,34 @@ impl_resolver_singleton!(PEImage, UWorldTick, |ctx| async {
 
     let n_specific = UWORLD_TICK_SPECIFIC.len();
 
-    let str_results = join_all(
+    BinaryMatcher::tagged_capture_patterns(
         UWORLD_TICK_SPECIFIC
             .iter()
             .chain(UWORLD_TICK_GENERIC.iter())
             .enumerate()
-            .map(|(i, s)| scan_tagged(ctx, i, util::utf16_pattern(s))),
-    )
-    .await;
-
-    let xref_results = join_all(
-        str_results
-            .into_iter()
-            .map(
-                |(idx, _pattern, addrs)| async move { (idx, util::scan_xrefs(ctx, &addrs).await) },
-            ),
-    )
-    .await;
-
-    let mut candidates = HashMap::new();
-    for (idx, refs) in xref_results {
-        for r in refs {
-            if let Some(f) = ctx.image().get_root_function(r)? {
-                let candidate =
-                    candidates
-                        .entry(f.range.start)
-                        .or_insert_with(|| WorldTickCandidate {
-                            anchors: HashSet::new(),
-                            size: f.range.end - f.range.start,
-                        });
-                candidate.anchors.insert(idx);
-            }
+            .map(|(index, text)| (index, util::utf16_pattern(text))),
+    )?
+    .references()
+    .root_functions()
+    .try_transform(move |nodes| {
+        let mut candidates = HashMap::new();
+        for node in nodes {
+            let function = node.value.as_ref();
+            let anchor = *node.parent().parent().tag;
+            let candidate =
+                candidates
+                    .entry(function.start)
+                    .or_insert_with(|| WorldTickCandidate {
+                        anchors: HashSet::new(),
+                        size: function.size(),
+                    });
+            candidate.anchors.insert(anchor);
         }
-    }
-    select_world_tick(candidates, n_specific).map(Self)
+        select_world_tick(candidates, n_specific)
+    })
+    .resolve(ctx)
+    .await
+    .map(|node| Self(*node.value))
 });
 impl_resolver_singleton!(ElfImage, UWorldTick, |_ctx| async {
     bail_out!("ElfImage unimplemented");

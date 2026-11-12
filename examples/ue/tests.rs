@@ -1105,6 +1105,64 @@ fn ftext_capture_pipeline_preserves_missing_and_conflicting_errors() {
 }
 
 #[test]
+#[cfg(feature = "image-pe")]
+fn world_tick_tagged_pipeline_preserves_anchor_identity_and_ranking() {
+    let specific = "UWorld_Tick\0";
+    let other_specific = "World Tick Time\0";
+    let generic = "ConnectionFailed\0";
+    let cases = [
+        (vec![(specific, 0x10)], Some(0x1000)),
+        (
+            vec![
+                (specific, 0x10),
+                (generic, 0x40),
+                ("Media\0", 0x48),
+                ("Your connection to the host has been lost.\0", 0x50),
+            ],
+            Some(0x1000),
+        ),
+        (
+            vec![(specific, 0x10), (other_specific, 0x18), (specific, 0x40)],
+            Some(0x1000),
+        ),
+        (
+            vec![(specific, 0x10), (specific, 0x18), (specific, 0x40)],
+            None,
+        ),
+        (vec![(generic, 0x10), ("Media\0", 0x18)], None),
+        (vec![(specific, 0x100)], None),
+        (vec![], None),
+    ];
+    for (anchors, expected) in cases {
+        let mut bytes = vec![0x90; 0x1000];
+        for (index, (text, site)) in anchors.into_iter().enumerate() {
+            let offset = 0x200 + index * 0x80;
+            let text = util::utf16(text);
+            bytes[offset..offset + text.len()].copy_from_slice(&text);
+            relative(
+                &mut bytes,
+                site,
+                &[0x48, 0x8d, 0x0d],
+                0x1000 + offset as u64,
+            );
+        }
+        let image = pe_image(bytes);
+        let result = image.resolve(models::engine::UWorldTick::resolver());
+        let upstream =
+            image.resolve(patternsleuth::resolvers::unreal::game_loop::UWorldTick::resolver());
+
+        assert_eq!(result.as_ref().ok().map(|value| value.0), expected);
+        assert_eq!(
+            result.as_ref().ok().map(|value| value.0),
+            upstream.as_ref().ok().map(|value| value.0)
+        );
+        if let (Err(result), Err(upstream)) = (result, upstream) {
+            assert_eq!(result.to_string(), upstream.to_string());
+        }
+    }
+}
+
+#[test]
 #[cfg(feature = "image-elf")]
 fn fname_to_string_elf_matches_upstream_call_target() {
     let mut bytes = vec![0x90; 256];
