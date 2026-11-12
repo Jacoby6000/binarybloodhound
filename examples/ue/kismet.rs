@@ -8,8 +8,32 @@ use patternsleuth::resolvers::ensure_one;
 
 use patternsleuth::{
     MemoryTrait,
+    image::Image,
     resolvers::{Result, bail_out, impl_resolver, impl_resolver_singleton},
 };
+
+fn find_instruction_displacement(
+    image: &Image<'_>,
+    address: u64,
+    limit: usize,
+    matches: impl Fn(&Instruction) -> bool,
+) -> Result<Option<u64>> {
+    let bytes = image.memory.range_from(address..)?;
+    let mut decoder = Decoder::with_ip(
+        64,
+        &bytes[..bytes.len().min(limit)],
+        address,
+        DecoderOptions::NONE,
+    );
+    let mut instruction = Instruction::default();
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instruction);
+        if matches(&instruction) {
+            return Ok(Some(instruction.memory_displacement64()));
+        }
+    }
+    Ok(None)
+}
 
 /// public: void __cdecl UObject::SkipFunction(struct FFrame &, void *const, class UFunction *)
 pub use super::models::kismet::UObjectSkipFunction;
@@ -87,22 +111,13 @@ impl_resolver_singleton!(PEImage, GNativesViaSkipFunction, |ctx| async {
     use iced_x86::{Code, Register};
 
     let skip_function = ctx.resolve(UObjectSkipFunction::resolver()).await?;
-    let bytes = ctx.image().memory.range_from(skip_function.0..)?;
-
-    let mut decoder = Decoder::with_ip(
-        64,
-        &bytes[0..bytes.len().min(500)],
-        skip_function.0,
-        DecoderOptions::NONE,
-    );
-
     // TODO recursive decode candidate
-    let mut instruction = Instruction::default();
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instruction);
-        if instruction.code() == Code::Lea_r64_m && instruction.memory_base() == Register::RIP {
-            return Ok(Self(instruction.memory_displacement64()));
-        }
+    if let Some(address) =
+        find_instruction_displacement(ctx.image(), skip_function.0, 500, |inst| {
+            inst.code() == Code::Lea_r64_m && inst.memory_base() == Register::RIP
+        })?
+    {
+        return Ok(Self(address));
     }
 
     bail_out!("failed to find LEA instruction");
@@ -110,21 +125,12 @@ impl_resolver_singleton!(PEImage, GNativesViaSkipFunction, |ctx| async {
 
 impl_resolver_singleton!(ElfImage, GNativesViaSkipFunction, |ctx| async {
     let skip_function = ctx.resolve(UObjectSkipFunction::resolver()).await?;
-    let bytes = ctx.image().memory.range_from(skip_function.0..)?;
-
-    let mut decoder = Decoder::with_ip(
-        64,
-        &bytes[0..bytes.len().min(500)],
-        skip_function.0,
-        DecoderOptions::NONE,
-    );
-
-    let mut instruction = Instruction::default();
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instruction);
-        if instruction.is_call_near_indirect() && instruction.memory_index_scale() == 8 {
-            return Ok(Self(instruction.memory_displacement64()));
-        }
+    if let Some(address) =
+        find_instruction_displacement(ctx.image(), skip_function.0, 500, |inst| {
+            inst.is_call_near_indirect() && inst.memory_index_scale() == 8
+        })?
+    {
+        return Ok(Self(address));
     }
 
     bail_out!("failed to find call instruction");
@@ -138,21 +144,10 @@ impl_resolver_singleton!(PEImage, GNativesViaFFrameStep, |ctx| async {
     use iced_x86::{Code, Register};
 
     let step = ctx.resolve(FFrameStep::resolver()).await?;
-    let bytes = ctx.image().memory.range_from(step.0..)?;
-
-    let mut decoder = Decoder::with_ip(
-        64,
-        &bytes[0..bytes.len().min(0x40)],
-        step.0,
-        DecoderOptions::NONE,
-    );
-
-    let mut instruction = Instruction::default();
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instruction);
-        if instruction.code() == Code::Lea_r64_m && instruction.memory_base() == Register::RIP {
-            return Ok(Self(instruction.memory_displacement64()));
-        }
+    if let Some(address) = find_instruction_displacement(ctx.image(), step.0, 0x40, |inst| {
+        inst.code() == Code::Lea_r64_m && inst.memory_base() == Register::RIP
+    })? {
+        return Ok(Self(address));
     }
 
     bail_out!("failed to find LEA instruction");
@@ -232,3 +227,62 @@ impl_resolver!(all, FFrameStepViaExec, |ctx| async {
         step_explicit_property: node.value.1,
     })
 });
+
+#[cfg(test)]
+mod tests {
+    use super::find_instruction_displacement;
+    use iced_x86::{Code, Register};
+
+    fn lea(inst: &iced_x86::Instruction) -> bool {
+        inst.code() == Code::Lea_r64_m && inst.memory_base() == Register::RIP
+    }
+
+    #[test]
+    fn native_decoder_keeps_first_match_without_function_metadata() {
+        let image = super::super::tests::image(vec![
+            0x48, 0x8d, 0x05, 0x10, 0, 0, 0, 0x48, 0x8d, 0x05, 0x20, 0, 0, 0,
+        ]);
+
+        assert_eq!(
+            find_instruction_displacement(&image, 0x1000, 500, lea).unwrap(),
+            Some(0x1017)
+        );
+    }
+
+    #[test]
+    fn native_decoder_respects_byte_limit_including_partial_instructions() {
+        let image = super::super::tests::image(vec![0x90, 0x48, 0x8d, 0x05, 0x10, 0, 0, 0]);
+
+        for limit in [0, 1, 7] {
+            assert_eq!(
+                find_instruction_displacement(&image, 0x1000, limit, lea).unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            find_instruction_displacement(&image, 0x1000, 8, lea).unwrap(),
+            Some(0x1018)
+        );
+    }
+
+    #[test]
+    fn native_decoder_propagates_unmapped_start() {
+        let image = super::super::tests::image(vec![]);
+        assert!(find_instruction_displacement(&image, 0x2000, 500, lea).is_err());
+    }
+
+    #[test]
+    fn native_decoder_retains_scaled_indirect_call_predicate() {
+        let image = super::super::tests::image(vec![
+            0xff, 0x14, 0x85, 0x10, 0x20, 0, 0, 0xff, 0x14, 0xc5, 0x30, 0x20, 0, 0,
+        ]);
+
+        assert_eq!(
+            find_instruction_displacement(&image, 0x1000, 500, |inst| {
+                inst.is_call_near_indirect() && inst.memory_index_scale() == 8
+            })
+            .unwrap(),
+            Some(0x2030)
+        );
+    }
+}
