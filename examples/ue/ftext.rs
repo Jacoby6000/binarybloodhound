@@ -1,21 +1,11 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/ftext.rs>
 
-use std::fmt::Debug;
-
-use futures::future::join_all;
-
-use super::scan::scan_tagged;
-use patternsleuth::scanner::Pattern;
-
-use patternsleuth::{
-    MemoryTrait,
-    resolvers::{impl_resolver_singleton, try_ensure_one},
-};
+use binary_bloodhound::BinaryMatcher;
+use patternsleuth::resolvers::{impl_resolver_singleton, try_ensure_one};
 
 /// private: __cdecl FText::FText(class FString &&)
 pub use super::models::ftext::FTextFString;
 impl_resolver_singleton!(all, FTextFString, |ctx| async {
-    #[derive(Debug)]
     enum Directness {
         Direct,
         Indirect,
@@ -23,15 +13,15 @@ impl_resolver_singleton!(all, FTextFString, |ctx| async {
     let patterns = [
         (
             Directness::Indirect,
-            "40 53 48 83 ec ?? 48 8b d9 e8 | ?? ?? ?? ?? 83 4b ?? 12 48 8b c3 48 83 ?? ?? 5b c3",
+            "40 53 48 83 ec ?? 48 8b d9 e8 [ ?? ?? ?? ?? ] 83 4b ?? 12 48 8b c3 48 83 ?? ?? 5b c3",
         ),
         (
             Directness::Indirect,
-            "eb 12 48 8d ?? 24 ?? e8 | ?? ?? ?? ?? ?? 02 00 00 00 48 8b 10 48 89 17",
+            "eb 12 48 8d ?? 24 ?? e8 [ ?? ?? ?? ?? ] ?? 02 00 00 00 48 8b 10 48 89 17",
         ),
         (
             Directness::Indirect,
-            "eb 12 48 8d ?? 24 ?? e8 | ?? ?? ?? ?? ?? 02 00 00 00 48 8b 10 89",
+            "eb 12 48 8d ?? 24 ?? e8 [ ?? ?? ?? ?? ] ?? 02 00 00 00 48 8b 10 89",
         ),
         (
             Directness::Direct,
@@ -64,7 +54,7 @@ impl_resolver_singleton!(all, FTextFString, |ctx| async {
         // FText::AsCultureInvariant on Linux
         (
             Directness::Indirect,
-            "48 85 c9 74 13 f0 83 41 08 01 eb 0c 48 89 df e8 | ?? ?? ?? ?? 48 8d 43 10",
+            "48 85 c9 74 13 f0 83 41 08 01 eb 0c 48 89 df e8 [ ?? ?? ?? ?? ] 48 8d 43 10",
         ),
         // FText::FText signature
         (
@@ -78,19 +68,15 @@ impl_resolver_singleton!(all, FTextFString, |ctx| async {
         ),
     ];
 
-    let res = join_all(
-        patterns
-            .iter()
-            .map(|(tag, p)| scan_tagged(ctx, tag, Pattern::new(p).unwrap())),
-    )
-    .await;
+    let matches = BinaryMatcher::tagged_capture_patterns(patterns)?
+        .resolve(ctx)
+        .await?;
 
-    let mem = &ctx.image().memory;
-
-    Ok(Self(try_ensure_one(res.iter().flat_map(
-        |(directness, _, a)| match directness {
-            Directness::Direct => itertools::Either::Right(a.iter().map(|a| Ok(*a))),
-            Directness::Indirect => itertools::Either::Left(a.iter().map(|a| Ok(mem.rip4(*a)?))),
+    // Keep decoding lazy: native uniqueness checking stops after four distinct values.
+    Ok(Self(try_ensure_one(matches.iter().map(
+        |node| match node.tag.as_ref() {
+            Directness::Direct => Ok(node.address),
+            Directness::Indirect => node.captures[0].rip4(),
         },
     ))?))
 });
