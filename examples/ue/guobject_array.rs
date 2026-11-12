@@ -213,6 +213,7 @@ mod tests {
         .unwrap();
 
         let addresses: Vec<_> = new.iter().map(|node| node.value.0).collect();
+
         assert_eq!(addresses, old);
         assert_eq!(addresses, [0x1030, 0x1020, 0x1010, 0x1020, 0x1010]);
         assert_eq!(

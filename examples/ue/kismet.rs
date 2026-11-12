@@ -268,6 +268,7 @@ mod tests {
     #[test]
     fn native_decoder_propagates_unmapped_start() {
         let image = super::super::tests::image(vec![]);
+
         assert!(find_instruction_displacement(&image, 0x2000, 500, lea).is_err());
     }
 

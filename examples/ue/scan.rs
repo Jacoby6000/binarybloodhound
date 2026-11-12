@@ -3,8 +3,7 @@
 use binary_bloodhound::{BinaryMatcher, IntoPattern};
 use patternsleuth::{resolvers::AsyncContext, scanner::Pattern};
 
-// Pattern sources cannot return resolver errors; keep the upstream scan shape for
-// heuristics that inspect captures or tag matches before choosing a candidate.
+// Preserve the native scanner's address-only return shape for legacy heuristics.
 pub(super) async fn scan(ctx: &AsyncContext<'_>, pattern: Pattern) -> Vec<u64> {
     scan_patterns(ctx, [pattern]).await
 }
@@ -20,27 +19,5 @@ pub(super) async fn scan_patterns<P: IntoPattern>(
         .expect("pattern scan")
         .into_iter()
         .map(|node| *node.value)
-        .collect()
-}
-
-pub(super) async fn scan_tagged<T>(
-    ctx: &AsyncContext<'_>,
-    tag: T,
-    pattern: Pattern,
-) -> (T, Pattern, Vec<u64>) {
-    let matches = scan(ctx, pattern.clone()).await;
-    (tag, pattern, matches)
-}
-
-#[cfg(any(feature = "image-pe", test))]
-pub(super) async fn scan_tagged2<T: Copy>(
-    ctx: &AsyncContext<'_>,
-    tag: T,
-    pattern: Pattern,
-) -> Vec<(T, u64)> {
-    scan(ctx, pattern)
-        .await
-        .into_iter()
-        .map(|address| (tag, address))
         .collect()
 }
