@@ -1,7 +1,7 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/guobject_array.rs>
 
-use binary_bloodhound::BinaryMatcher;
-use futures::{future::join_all, join, try_join};
+use binary_bloodhound::{BinaryMatcher, Matcher};
+use futures::{join, try_join};
 
 use super::scan::scan_patterns;
 
@@ -117,30 +117,23 @@ impl_resolver_singleton!(all, FUObjectArrayAllocateUObjectIndex, |ctx| async {
 /// public: void __cdecl FUObjectArray::FreeUObjectIndex(class UObjectBase *)
 pub use super::models::objects::FUObjectArrayFreeUObjectIndex;
 impl_resolver_singleton!(all, FUObjectArrayFreeUObjectIndex, |ctx| async {
-    let refs_future = async {
-        let search_strings = [
+    let refs = BinaryMatcher::patterns(
+        [
             "Removing object (0x%016llx) at index %d but the index points to a different object (0x%016llx)!",
             "Unexpected concurency while adding new object",
-        ];
-        let strings = join_all(
-            search_strings
-                .into_iter()
-                .map(|s| util::string_pattern(ctx, s)),
-        )
-        .await
+        ]
         .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-        Ok(util::scan_xrefs(ctx, &strings).await)
-    };
+        .flat_map(|s| [util::utf16_pattern(s), util::utf8_pattern(s)]),
+    )?
+    .references();
 
     // same string is present in both functions so resolve the other so we can filter it out
     let (allocate_uobject, refs) = try_join!(
         ctx.resolve(FUObjectArrayAllocateUObjectIndex::resolver()),
-        refs_future,
+        refs.resolve(ctx),
     )?;
 
-    BinaryMatcher::candidates(refs)
+    Matcher::from_nodes(refs)
         .root_functions()
         .addresses()
         .filter(|address| *address.value != allocate_uobject.0)
@@ -181,3 +174,52 @@ impl_resolver_singleton!(ElfImage, UObjectBaseShutdown, |ctx| async {
         .await
         .map(|node| Self(*node.value))
 });
+
+#[cfg(test)]
+mod tests {
+    use super::{BinaryMatcher, util};
+    use patternsleuth::resolvers::eval;
+
+    #[test]
+    fn mixed_encoding_reference_pipeline_preserves_source_order_and_duplicates() {
+        let mut bytes = vec![0x90; 512];
+        bytes[0x80..0x84].copy_from_slice(b"one\0");
+        bytes[0x90..0x98].copy_from_slice(&util::utf16("one\0"));
+        bytes[0xa0..0xa4].copy_from_slice(b"two\0");
+        for (offset, target) in [(0x10, 0x1080), (0x20, 0x1090), (0x30, 0x10a0)] {
+            bytes[offset..offset + 3].copy_from_slice(&[0x48, 0x8d, 0x05]);
+            let displacement = (target as i32 - (0x1000 + offset as i32 + 7)).to_le_bytes();
+            bytes[offset + 3..offset + 7].copy_from_slice(&displacement);
+        }
+        let image = super::super::tests::image(bytes);
+        let (old, new) = eval(&image, |ctx| {
+            Box::pin(async move {
+                let mut strings = Vec::new();
+                for text in ["two\0", "one\0", "one\0"] {
+                    strings.extend(util::string_pattern(ctx, text).await);
+                }
+                let old = util::scan_xrefs(ctx, &strings).await;
+                let new = BinaryMatcher::patterns(
+                    ["two\0", "one\0", "one\0"]
+                        .into_iter()
+                        .flat_map(|s| [util::utf16_pattern(s), util::utf8_pattern(s)]),
+                )?
+                .references()
+                .resolve(ctx)
+                .await?;
+                patternsleuth::resolvers::Result::Ok((old, new))
+            })
+        })
+        .unwrap();
+
+        let addresses: Vec<_> = new.iter().map(|node| node.value.0).collect();
+        assert_eq!(addresses, old);
+        assert_eq!(addresses, [0x1030, 0x1020, 0x1010, 0x1020, 0x1010]);
+        assert_eq!(
+            new.iter()
+                .map(|node| *node.parent().value)
+                .collect::<Vec<_>>(),
+            [0x10a0, 0x1090, 0x1080, 0x1090, 0x1080]
+        );
+    }
+}
