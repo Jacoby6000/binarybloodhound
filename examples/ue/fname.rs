@@ -1,9 +1,11 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/fname.rs>
 
-use futures::future::join_all;
-
+#[cfg(feature = "image-elf")]
 use super::scan::scan;
 use binary_bloodhound::{BinaryMatcher, Matcher};
+#[cfg(feature = "image-elf")]
+use futures::future::join_all;
+#[cfg(feature = "image-elf")]
 use patternsleuth::scanner::Pattern;
 
 use super::util;
@@ -11,7 +13,7 @@ use super::util;
 use patternsleuth::MemoryTrait;
 use patternsleuth::resolvers::ResolveError;
 #[cfg(feature = "image-pe")]
-use patternsleuth::resolvers::{Result, try_ensure_one};
+use patternsleuth::resolvers::try_ensure_one;
 use patternsleuth::resolvers::{ensure_one, impl_resolver_singleton};
 
 /// public: __cdecl FName::FName(wchar_t const *, enum EFindName)
@@ -199,45 +201,27 @@ impl_resolver_singleton!(PEImage, FNameToString, |ctx| async {
     use iced_x86::{Code, Decoder, DecoderOptions};
     use patternsleuth::{MemoryTrait, resolvers::Context};
 
-    let patterns = async {
-        let patterns = ["56 57 48 83 EC 28 48 89 D6 48 89 CF 83 79 ?? 00 74"];
-
-        join_all(patterns.iter().map(|p| scan(ctx, Pattern::new(p).unwrap())))
-            .await
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-    };
+    let patterns = BinaryMatcher::patterns(["56 57 48 83 EC 28 48 89 D6 48 89 CF 83 79 ?? 00 74"])?;
+    let patterns = patterns.resolve(ctx);
 
     let string = async {
         // Locates either variant by searching for a string ref and finding the first function
         // call directly above it. Which variant depends on how much inlining has occured
-        let s = Pattern::from_bytes(
-            "  DrivingBone: %s\nDrivenParamet"
-                .encode_utf16()
-                .flat_map(u16::to_le_bytes)
-                .collect(),
-        )
-        .unwrap();
-        let strings = scan(ctx, s).await;
-
-        let refs = join_all(
-            strings
-                .iter()
-                .map(|s| scan(ctx, Pattern::new(format!("48 8d 15 X0x{s:x}")).unwrap())),
-        )
-        .await;
-
-        let fn_gather_debug_data = ensure_one(
-            refs.into_iter()
-                .flatten()
-                .map(|r| -> Result<_> {
-                    Ok(ctx.image().get_root_function(r)?.map(|f| f.range.start..r))
+        let ranges =
+            BinaryMatcher::pattern(util::utf16_pattern("  DrivingBone: %s\nDrivenParamet"))
+                .try_flat_map(|s| BinaryMatcher::patterns([format!("48 8d 15 X0x{:x}", *s.value)]))
+                .with_context()
+                .try_map_filter(|(ctx, r)| {
+                    Ok(ctx
+                        .image()
+                        .get_root_function(*r.value)?
+                        .map(|f| f.range.start..*r.value))
                 })
-                .collect::<Result<Vec<_>>>()? // TODO avoid this collect?
-                .into_iter()
-                .flatten(),
-        )?;
+                .resolve(ctx)
+                .await?;
+        // Finish every root lookup before native uniqueness checking.
+        let fn_gather_debug_data =
+            ensure_one(ranges.into_iter().map(|node| (*node.value).clone()))?;
 
         let bytes = ctx.image().memory.range(fn_gather_debug_data.clone())?;
 
@@ -265,8 +249,11 @@ impl_resolver_singleton!(PEImage, FNameToString, |ctx| async {
     );
 
     // use pattern if found
-    if !any.3.is_empty() {
-        return Ok(Self(ensure_one(any.3)?));
+    let patterns = any.3?;
+    if !patterns.is_empty() {
+        return Ok(Self(ensure_one(
+            patterns.into_iter().map(|node| *node.value),
+        )?));
     }
 
     Ok(Self(any.0.map(|r| r.0).or(any.1.map(|r| r.0)).or(any.2)?))
@@ -425,3 +412,88 @@ impl_resolver_singleton!(all, StaticFNameConst, |ctx| async {
     .await
     .map(|node| Self(*node.value))
 });
+
+#[cfg(all(test, feature = "image-pe"))]
+mod cleanup_tests {
+    use super::*;
+    use object::SectionKind;
+    use patternsleuth::{
+        NamedMemorySection,
+        image::{Image, ImageType},
+        scanner::Pattern,
+    };
+
+    fn image(bytes: Vec<u8>) -> Image<'static> {
+        let image = super::super::tests::image(bytes);
+        Image::from_memory(
+            0x1000,
+            image.memory,
+            ImageType::PEImage(patternsleuth::image::pe::PEImage {
+                exception_directory_range: 0x3000..0x300c,
+                exception_children_cache: Default::default(),
+            }),
+        )
+        .with_section(NamedMemorySection::new(
+            ".pdata".into(),
+            0x3000,
+            SectionKind::ReadOnlyData,
+            [0_u32, 0x80, 0x2100]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        ))
+        .with_section(NamedMemorySection::new(
+            ".xdata".into(),
+            0x3100,
+            SectionKind::ReadOnlyData,
+            vec![1, 0, 0, 0],
+        ))
+    }
+
+    fn relative(bytes: &mut [u8], offset: usize, prefix: &[u8], target: u64) {
+        bytes[offset..offset + prefix.len()].copy_from_slice(prefix);
+        let at = offset + prefix.len();
+        let displacement = i32::try_from(target as i64 - (0x1000 + at + 4) as i64).unwrap();
+        bytes[at..at + 4].copy_from_slice(&displacement.to_le_bytes());
+    }
+
+    #[test]
+    fn to_string_string_pipeline_matches_native_last_call_and_pattern_priority() {
+        for (references, patterns, expected) in [
+            (0, 0, None),
+            (1, 0, Some(0x1900)),
+            (2, 0, None),
+            (2, 1, Some(0x1200)),
+            (1, 2, None),
+        ] {
+            let mut bytes = vec![0x90; 0x1000];
+            let text = util::utf16("  DrivingBone: %s\nDrivenParamet");
+            bytes[0x800..0x800 + text.len()].copy_from_slice(&text);
+            relative(&mut bytes, 0, &[0xe8], 0x1800);
+            relative(&mut bytes, 0x10, &[0xe8], 0x1900);
+            for index in 0..references {
+                relative(&mut bytes, 0x30 + index * 0x10, &[0x48, 0x8d, 0x15], 0x1800);
+            }
+            let pattern =
+                Pattern::new("56 57 48 83 EC 28 48 89 D6 48 89 CF 83 79 ?? 00 74").unwrap();
+            for index in 0..patterns {
+                let start = 0x200 + index * 0x40;
+                bytes[start..start + pattern.simple.sig.len()].copy_from_slice(&pattern.simple.sig);
+            }
+            let image = image(bytes);
+            let result = image.resolve(FNameToString::resolver());
+            let upstream =
+                image.resolve(patternsleuth::resolvers::unreal::fname::FNameToString::resolver());
+
+            assert_eq!(result.as_ref().ok().map(|value| value.0), expected);
+            assert_eq!(
+                result
+                    .map(|value| value.0)
+                    .map_err(|error| error.to_string()),
+                upstream
+                    .map(|value| value.0)
+                    .map_err(|error| error.to_string())
+            );
+        }
+    }
+}
