@@ -11,6 +11,11 @@ use patternsleuth::{
 };
 
 type AddressRead = for<'a> fn(BinaryMatcher<'a>) -> Matcher<'a, (), u64, Variable, Trace<u64>>;
+const ADDRESS_READS: [AddressRead; 3] = [
+    |matcher| matcher.rip4(),
+    |matcher| matcher.read_u64(),
+    |matcher| matcher.deref(),
+];
 
 fn section(
     name: &str,
@@ -29,17 +34,10 @@ fn run<T: HasAddress + Send + Sync, P: Send + Sync, C: Cardinality>(
     image: &Image<'_>,
     matcher: Matcher<'_, (), T, C, P>,
 ) -> Result<Vec<u64>> {
-    eval(image, move |ctx| {
-        Box::pin(async move {
-            Ok(matcher
-                .into_variable()
-                .resolve(ctx)
-                .await?
-                .iter()
-                .map(HasAddress::address)
-                .collect())
-        })
-    })
+    Ok(run_nodes(image, matcher.into_variable(), ())?
+        .iter()
+        .map(HasAddress::address)
+        .collect())
 }
 
 fn patterns<'scope>(values: &[&str]) -> BinaryMatcher<'scope> {
@@ -73,17 +71,12 @@ where
     P: Send + Sync,
     C::Output<O>: Sync,
 {
-    eval(image, move |ctx| {
-        Box::pin(async move {
-            let nodes = matcher.into_variable().run(input, ctx).await?;
-            C::finish(
-                nodes
-                    .into_iter()
-                    .map(|node| node.value.as_ref().clone())
-                    .collect(),
-            )
-        })
-    })
+    C::finish(
+        run_nodes(image, matcher.into_variable(), input)?
+            .into_iter()
+            .map(|node| node.value.as_ref().clone())
+            .collect(),
+    )
 }
 
 #[test]
@@ -146,12 +139,7 @@ fn address_reads_deref_chains_without_validating_the_final_destination() {
 #[test]
 fn address_reads_propagate_truncated_and_unmapped_memory_errors() {
     let image = image(vec![0; 8]);
-    let operations: [AddressRead; 3] = [
-        |matcher| matcher.rip4(),
-        |matcher| matcher.read_u64(),
-        |matcher| matcher.deref(),
-    ];
-    for operation in operations {
+    for operation in ADDRESS_READS {
         for address in [TEXT + 7, TEXT + 16] {
             let result = run(&image, operation(BinaryMatcher::address(address)));
 
@@ -166,12 +154,7 @@ fn address_reads_propagate_truncated_and_unmapped_memory_errors() {
 #[test]
 fn address_reads_reject_read_range_overflow_before_accessing_memory() {
     let image = image(vec![]);
-    let operations: [AddressRead; 3] = [
-        |matcher| matcher.rip4(),
-        |matcher| matcher.read_u64(),
-        |matcher| matcher.deref(),
-    ];
-    for operation in operations {
+    for operation in ADDRESS_READS {
         let error = run(&image, operation(BinaryMatcher::address(u64::MAX))).unwrap_err();
 
         assert!(error.to_string().contains("overflow"));
@@ -265,7 +248,7 @@ fn new_passes_non_clone_input_and_infers_transformed_output() {
 }
 
 #[test]
-fn from_sync_infers_types_and_accepts_borrowed_inputs_outputs_and_captures() {
+fn from_value_infers_types_and_accepts_borrowed_inputs_outputs_and_captures() {
     let text = String::from("prefix:payload");
     let prefix = String::from("prefix:");
     let stage =
@@ -1682,18 +1665,22 @@ fn callers_return_call_and_jump_sites() {
     );
 }
 
-#[test]
-fn references_and_callers_retain_indirect_pointer_scan_behavior() {
+fn indirect_reference_image() -> Image<'static> {
     let pointer = BASE + 0x5000;
     let mut text = vec![0x90; 256];
     relative(&mut text, 8, &[0x48, 0x8d, 0x0d], pointer);
     relative(&mut text, 72, &[0xe8], pointer);
-    let image = image(text).with_section(section(
+    image(text).with_section(section(
         ".data",
         pointer,
         SectionKind::Data,
         TARGET.to_le_bytes().to_vec(),
-    ));
+    ))
+}
+
+#[test]
+fn references_and_callers_retain_indirect_pointer_scan_behavior() {
+    let image = indirect_reference_image();
     assert_eq!(
         run(&image, BinaryMatcher::address(TARGET).references()).unwrap(),
         [TEXT + 8]
@@ -1792,7 +1779,7 @@ fn callees_preserve_input_order_duplicate_targets_and_recursive_calls() {
 #[test]
 fn outgoing_calls_follow_local_branches_but_not_external_branches_or_dead_code() {
     let mut text = vec![0x90; 256];
-    // Visit the taken block before the fallthrough block, but return sites sorted by IP.
+    // Return sites sorted by IP, regardless of traversal order.
     relative(&mut text, 0, &[0x0f, 0x84], TEXT + 0x20);
     relative(&mut text, 8, &[0xe8], TARGET);
     text[13] = 0xc3;
@@ -2114,14 +2101,20 @@ fn map_filter_preserves_order_and_duplicates_but_returns_variable() {
 
 #[test]
 fn map_filter_skips_empty_input_and_supports_non_clone_values() {
+    struct Candidate(String);
     let empty = Matcher::items::<u64>()
         .map_filter(|_| -> Option<u64> { panic!("empty candidates must skip callbacks") });
-    let matcher = Matcher::items::<String>()
-        .map_filter(|value| (!value.is_empty()).then(|| value.value.as_ref().clone()));
+    let matcher = Matcher::items::<Candidate>()
+        .map_filter(|node| (!node.0.is_empty()).then(|| node.0.clone()));
 
     assert!(run_stage(&scan_image(), empty, vec![]).unwrap().is_empty());
     assert_eq!(
-        run_stage(&scan_image(), matcher, vec!["value".into(), String::new()]).unwrap(),
+        run_stage(
+            &scan_image(),
+            matcher,
+            vec![Candidate("value".into()), Candidate(String::new())]
+        )
+        .unwrap(),
         ["value"]
     );
 }
@@ -2188,16 +2181,7 @@ fn xrefs_resolve_lea_calls_and_jumps_to_containing_roots() {
 
 #[test]
 fn xrefs_find_indirect_pointer_references() {
-    let pointer = BASE + 0x5000;
-    let mut text = vec![0x90; 256];
-    relative(&mut text, 8, &[0x48, 0x8d, 0x0d], pointer);
-    relative(&mut text, 72, &[0xe8], pointer);
-    let image = image(text).with_section(section(
-        ".data",
-        pointer,
-        SectionKind::Data,
-        TARGET.to_le_bytes().to_vec(),
-    ));
+    let image = indirect_reference_image();
     assert_eq!(run(&image, xrefs(TARGET)).unwrap(), [TEXT, TEXT + 64]);
 }
 

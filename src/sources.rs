@@ -136,7 +136,7 @@ impl<'scope> Matcher<'scope, (), ()> {
     }
 
     pub fn items<T: Send + Sync + 'scope>() -> Matcher<'scope, Vec<T>, T> {
-        Matcher::from_sync(Ok)
+        Matcher::identity()
     }
 
     #[allow(clippy::new_ret_no_self)]
