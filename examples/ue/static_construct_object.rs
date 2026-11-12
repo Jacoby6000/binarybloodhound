@@ -2,11 +2,10 @@
 
 use std::collections::HashSet;
 
+#[cfg(feature = "image-elf")]
 use super::scan::scan;
 use binary_bloodhound::BinaryMatcher;
 use futures::join;
-#[cfg(feature = "image-pe")]
-use {super::scan::scan_tagged2, futures::future::join_all, patternsleuth::scanner::Pattern};
 
 use super::util;
 use patternsleuth::{
@@ -117,6 +116,7 @@ impl_resolver_singleton!(PEImage, StaticConstructObjectInternalString, |ctx| asy
         disassemble::disassemble_single,
         image::Image,
         resolvers::{Result, bail_out},
+        scanner::Pattern,
     };
 
     // StaticConstructObject_Internal contains magic RF-flags test
@@ -136,6 +136,15 @@ impl_resolver_singleton!(PEImage, StaticConstructObjectInternalString, |ctx| asy
             Ok(Control::Continue)
         })?;
         Ok(is)
+    }
+
+    fn deref_thunk(img: &Image<'_>, mut callee: u64) -> Result<u64> {
+        if let Some(inst) = disassemble_single(img, callee)?
+            && inst.flow_control() == FlowControl::UnconditionalBranch
+        {
+            callee = inst.near_branch_target();
+        }
+        Ok(callee)
     }
 
     // phase 1: class-name anchors
@@ -177,81 +186,58 @@ impl_resolver_singleton!(PEImage, StaticConstructObjectInternalString, |ctx| asy
 
         if check(f)? {
             return Ok(true);
-        } else {
-            // sometimes can be a call deep so check all outgoing calls as well
-            for call in util::find_calls(img, f)? {
-                let mut f = call.callee;
-                // sometimes there's a jmp stub between
-                if let Some(inst) = disassemble_single(img, f)?
-                    && inst.flow_control() == FlowControl::UnconditionalBranch
-                {
-                    f = inst.near_branch_target();
-                }
+        }
+        // sometimes can be a call deep so check all outgoing calls as well
+        for call in util::find_calls(img, f)? {
+            let f = deref_thunk(img, call.callee)?;
 
-                if check(f)? {
-                    return Ok(true);
-                }
+            if check(f)? {
+                return Ok(true);
             }
         }
         Ok(false)
     }
 
-    let strings = join_all(
+    let strings = BinaryMatcher::patterns(
         [
             "UBehaviorTreeManager\0",
             "ULeaderboardFlushCallbackProxy\0",
             "UPlayMontageCallbackProxy\0",
         ]
-        .iter()
-        .map(|s| {
-            scan(
-                ctx,
-                Pattern::from_bytes(s.encode_utf16().flat_map(u16::to_le_bytes).collect()).unwrap(),
-            )
-        }),
-    )
-    .await;
+        .map(util::utf16_pattern),
+    )?
+    .resolve(ctx)
+    .await?;
 
-    let refs_indirect = join_all(strings.iter().flatten().map(|s| {
-        scan(
-            ctx,
-            Pattern::from_bytes(u64::to_le_bytes(*s).into()).unwrap(),
-        )
-    }))
-    .await;
-
-    let refs = join_all(
+    let refs_indirect = BinaryMatcher::patterns(
         strings
             .iter()
-            .flatten()
-            .chain(refs_indirect.iter().flatten())
-            .flat_map(|s| {
-                [
-                    scan(ctx, Pattern::new(format!("48 8d ?? X0x{s:X}")).unwrap()),
-                    scan(ctx, Pattern::new(format!("4c 8d ?? X0x{s:X}")).unwrap()),
-                    scan(
-                        ctx,
-                        Pattern::new(format!("48 8d ?? X0x{:X}", s + 2)).unwrap(),
-                    ),
-                    scan(
-                        ctx,
-                        Pattern::new(format!("4c 8d ?? X0x{:X}", s + 2)).unwrap(),
-                    ),
-                ]
-            }),
-    )
-    .await;
+            .map(|s| Pattern::from_bytes(s.value.to_le_bytes().into()).unwrap()),
+    )?
+    .resolve(ctx)
+    .await?;
 
-    let fns = refs
-        .into_iter()
-        .flatten()
-        .map(|r| -> Result<_> { Ok(ctx.image().get_root_function(r)?.map(|f| f.range.start)) })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten();
+    let fns = BinaryMatcher::patterns(strings.iter().chain(&refs_indirect).flat_map(|s| {
+        let s = *s.value;
+        [
+            format!("48 8d ?? X0x{s:X}"),
+            format!("4c 8d ?? X0x{s:X}"),
+            format!("48 8d ?? X0x{:X}", s + 2),
+            format!("4c 8d ?? X0x{:X}", s + 2),
+        ]
+    }))?
+    .with_context()
+    .try_map_filter(|(ctx, node)| {
+        Ok(ctx
+            .image()
+            .get_root_function(*node.value)?
+            .map(|f| f.range.start))
+    })
+    .resolve(ctx)
+    .await?;
 
     let new_object = {
-        let mut fns = fns.collect_vec();
+        let mut fns = fns.into_iter().map(|node| *node.value).collect_vec();
 
         let mut new_object = None;
         for f in &fns {
@@ -262,44 +248,33 @@ impl_resolver_singleton!(PEImage, StaticConstructObjectInternalString, |ctx| asy
         }
 
         'root: for _ in 0..2 {
-            #[derive(Clone, Copy)]
             enum CallType {
                 Call,
                 Jump,
             }
 
             if new_object.is_none() {
-                let calls = join_all(fns.into_iter().flat_map(|f| {
+                fns = BinaryMatcher::tagged_capture_patterns(fns.into_iter().flat_map(|f| {
                     [
-                        scan_tagged2(
-                            ctx,
-                            CallType::Call,
-                            Pattern::new(format!("e8 X0x{f:x}")).unwrap(),
-                        ),
-                        scan_tagged2(
-                            ctx,
-                            CallType::Jump,
-                            Pattern::new(format!("e9 X0x{f:x}")).unwrap(),
-                        ),
+                        (CallType::Call, format!("e8 X0x{f:x}")),
+                        (CallType::Jump, format!("e9 X0x{f:x}")),
                     ]
-                }))
-                .await;
-
-                fns = calls
-                    .into_iter()
-                    .flatten()
-                    .map(|(t, r)| -> Result<_> {
-                        Ok(match t {
-                            CallType::Call => {
-                                ctx.image().get_root_function(r)?.map(|f| f.range.start)
-                            }
-                            CallType::Jump => Some(r),
-                        })
+                }))?
+                .with_context()
+                .try_map_filter(|(ctx, node)| {
+                    Ok(match node.tag.as_ref() {
+                        CallType::Call => ctx
+                            .image()
+                            .get_root_function(node.address)?
+                            .map(|f| f.range.start),
+                        CallType::Jump => Some(node.address),
                     })
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect_vec();
+                })
+                .resolve(ctx)
+                .await?
+                .into_iter()
+                .map(|node| *node.value)
+                .collect_vec();
             }
 
             for f in &fns {
@@ -316,12 +291,7 @@ impl_resolver_singleton!(PEImage, StaticConstructObjectInternalString, |ctx| asy
         let mut checked = HashSet::new();
         for call in util::find_calls(ctx.image(), new_object)? {
             if checked.insert(call.callee) {
-                let mut f = call.callee;
-                if let Some(inst) = disassemble_single(ctx.image(), f)?
-                    && inst.flow_control() == FlowControl::UnconditionalBranch
-                {
-                    f = inst.near_branch_target();
-                }
+                let f = deref_thunk(ctx.image(), call.callee)?;
 
                 if check_is_static_construct(ctx.image(), f)? {
                     return Ok(Self(call.callee));
@@ -341,46 +311,38 @@ impl_resolver_singleton!(PEImage, StaticConstructObjectInternalString, |ctx| asy
     }
 
     // phase 2: empty-name consensus
-    let deref_thunk = |mut callee: u64| -> Result<u64> {
-        if let Some(inst) = disassemble_single(ctx.image(), callee)?
-            && inst.flow_control() == FlowControl::UnconditionalBranch
-        {
-            callee = inst.near_branch_target();
-        }
-        Ok(callee)
-    };
-
-    let strings = scan(
-        ctx,
-        util::utf16_pattern("NewObject with empty name can't be used to create default"),
-    )
-    .await;
-    let refs = util::scan_xrefs(ctx, &strings).await;
-    let new_object_fns = refs
-        .iter()
-        .filter_map(|r| {
-            ctx.image()
-                .get_root_function(*r)
-                .ok()
-                .flatten()
-                .map(|f| f.range.start)
-        })
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let new_object_fns = BinaryMatcher::pattern(util::utf16_pattern(
+        "NewObject with empty name can't be used to create default",
+    ))
+    .references()
+    .with_context()
+    .map_filter(|(ctx, r)| {
+        ctx.image()
+            .get_root_function(r.value.0)
+            .ok()
+            .flatten()
+            .map(|f| f.range.start)
+    })
+    .resolve(ctx)
+    .await?
+    .into_iter()
+    .map(|node| *node.value)
+    .collect::<HashSet<_>>()
+    .into_iter()
+    .collect::<Vec<_>>();
 
     let mut counts: HashMap<u64, usize> = HashMap::new();
     for depth in 0..2 {
         for &f in &new_object_fns {
             for call in util::find_calls(ctx.image(), f)? {
-                let callee = deref_thunk(call.callee)?;
+                let callee = deref_thunk(ctx.image(), call.callee)?;
                 if depth == 0 {
                     if check_is_static_construct(ctx.image(), callee)? {
                         *counts.entry(callee).or_default() += 1;
                     }
                 } else {
                     for inner in util::find_calls(ctx.image(), callee)? {
-                        let inner = deref_thunk(inner.callee)?;
+                        let inner = deref_thunk(ctx.image(), inner.callee)?;
                         if check_is_static_construct(ctx.image(), inner)? {
                             *counts.entry(inner).or_default() += 1;
                         }
@@ -398,3 +360,120 @@ impl_resolver_singleton!(PEImage, StaticConstructObjectInternalString, |ctx| asy
     };
     Ok(Self(addr))
 });
+
+#[cfg(all(test, feature = "image-pe"))]
+mod cleanup_tests {
+    use super::*;
+    use object::SectionKind;
+    use patternsleuth::{
+        NamedMemorySection,
+        image::{Image, ImageType},
+    };
+
+    fn image(bytes: Vec<u8>) -> Image<'static> {
+        let image = super::super::tests::image(bytes);
+        Image::from_memory(
+            0x1000,
+            image.memory,
+            ImageType::PEImage(patternsleuth::image::pe::PEImage {
+                exception_directory_range: 0x3000..0x3030,
+                exception_children_cache: Default::default(),
+            }),
+        )
+        .with_section(NamedMemorySection::new(
+            ".pdata".into(),
+            0x3000,
+            SectionKind::ReadOnlyData,
+            (0..4_u32)
+                .flat_map(|index| [index * 0x100, index * 0x100 + 0x80, 0x2100])
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        ))
+        .with_section(NamedMemorySection::new(
+            ".xdata".into(),
+            0x3100,
+            SectionKind::ReadOnlyData,
+            vec![1, 0, 0, 0],
+        ))
+    }
+
+    fn relative(bytes: &mut [u8], offset: usize, prefix: &[u8], target: u64) {
+        bytes[offset..offset + prefix.len()].copy_from_slice(prefix);
+        let at = offset + prefix.len();
+        let displacement = i32::try_from(target as i64 - (0x1000 + at + 4) as i64).unwrap();
+        bytes[at..at + 4].copy_from_slice(&displacement.to_le_bytes());
+    }
+
+    #[test]
+    fn anchor_pipelines_match_native_direct_indirect_ancestors_and_consensus_fallback() {
+        for (anchor, indirect, thunk) in [
+            (true, false, false),
+            (true, true, false),
+            (false, false, false),
+            (true, false, true),
+            (false, false, true),
+        ] {
+            for depth in 0..3 {
+                let mut bytes = vec![0x90; 0x1000];
+                for start in [0, 0x100, 0x200, 0x300] {
+                    bytes[start + 0x40] = 0xc3;
+                }
+                for (offset, text) in [
+                    (0x800, "UBehaviorTreeManager\0"),
+                    (
+                        0x900,
+                        "NewObject with empty name can't be used to create default",
+                    ),
+                ] {
+                    if offset == 0x800 && !anchor {
+                        continue;
+                    }
+                    let text = util::utf16(text);
+                    bytes[offset..offset + text.len()].copy_from_slice(&text);
+                }
+                bytes[0x700..0x708].copy_from_slice(&0x1800_u64.to_le_bytes());
+                relative(
+                    &mut bytes,
+                    0,
+                    &[0x48, 0x8d, 0x0d],
+                    if indirect { 0x1700 } else { 0x1800 },
+                );
+                // A second matching LEA retains duplicate candidate roots.
+                relative(
+                    &mut bytes,
+                    0x10,
+                    &[0x4c, 0x8d, 0x05],
+                    if indirect { 0x1702 } else { 0x1802 },
+                );
+                let new_object = if depth == 0 { 0 } else { 0x100 };
+                relative(&mut bytes, new_object + 0x20, &[0x48, 0x8d, 0x15], 0x1900);
+                relative(
+                    &mut bytes,
+                    new_object + 0x30,
+                    &[0xe8],
+                    if thunk { 0x1250 } else { 0x1200 },
+                );
+                relative(&mut bytes, 0x250, &[0xe9], 0x1200);
+                if depth == 1 {
+                    relative(&mut bytes, 0x100, &[0xe8], 0x1000);
+                } else if depth == 2 {
+                    relative(&mut bytes, 0x300, &[0xe9], 0x1000);
+                    relative(&mut bytes, 0x100, &[0xe8], 0x1300);
+                }
+                bytes[0x200..0x206].copy_from_slice(&[0xb8, 0x80, 0, 0, 0x10, 0xc3]);
+                let image = image(bytes);
+                let result = image
+                    .resolve(StaticConstructObjectInternalString::resolver())
+                    .unwrap();
+                let upstream = image.resolve(patternsleuth::resolvers::unreal::static_construct_object::StaticConstructObjectInternalString::resolver()).unwrap();
+                let expected = if anchor && thunk { 0x1250 } else { 0x1200 };
+
+                assert_eq!(
+                    result.0, expected,
+                    "anchor={anchor}, indirect={indirect}, depth={depth}, thunk={thunk}"
+                );
+                assert_eq!(result.0, upstream.0);
+            }
+        }
+    }
+}
