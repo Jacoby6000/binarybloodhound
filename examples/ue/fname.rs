@@ -2,8 +2,6 @@
 
 use futures::future::join_all;
 
-#[cfg(feature = "image-pe")]
-use super::scan::scan_tagged2;
 use super::scan::{scan, scan_tagged};
 use binary_bloodhound::BinaryMatcher;
 use patternsleuth::scanner::Pattern;
@@ -83,28 +81,27 @@ impl_resolver_singleton!(ElfImage, FNameCtorWchar, |ctx| async {
 });
 
 impl_resolver_singleton!(PEImage, FNameCtorWchar, |ctx| async {
+    use super::scan::scan_patterns;
     use futures::join;
     use iced_x86::{Code, Decoder, DecoderOptions};
     use patternsleuth::{MemoryTrait, resolvers::Context};
 
     // FName(wchar_t const*, EFindName) prologue
-    let ctor = async {
-        join_all([
+    let ctor = scan_patterns(
+        ctx,
+        [
             "48 89 5C 24 08 57 48 83 EC 30 48 8B D9 41 8B F8 33 C9 4C 8B DA 44 8B D1 4C 8B CA 48 85 D2 74 ?? 0F B7 02 66 85 C0",
             "48 89 5C 24 08 57 48 83 EC 30 48 8B D9 48 89 54 24 20 33 C9 41 8B F8 4C 8B D2 44 8B C9 48 85 D2 74 ?? 0F B7 02 66 85 C0",
-        ].map(|p| scan(ctx, Pattern::new(p).unwrap())))
-        .await
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-    };
-    let strings = async {
-        let strings = ["TGPUSkinVertexFactoryUnlimited\0", "MovementComponent0\0"];
-        join_all(strings.iter().map(|s| scan(ctx, util::utf16_pattern(s)))).await
-    };
-    let patterns = async {
-        scan(ctx, Pattern::new("EB 07 48 8D 15 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 41 B8 01 00 00 00 E8 | ?? ?? ?? ??").unwrap()).await
-    };
+        ],
+    );
+    let strings = scan_patterns(
+        ctx,
+        ["TGPUSkinVertexFactoryUnlimited\0", "MovementComponent0\0"].map(util::utf16_pattern),
+    );
+    let patterns = scan_patterns(
+        ctx,
+        ["EB 07 48 8D 15 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 41 B8 01 00 00 00 E8 | ?? ?? ?? ??"],
+    );
     let (ctor, patterns, strings) = join!(ctor, patterns, strings);
 
     // prefer the direct prologue match when present
@@ -126,53 +123,50 @@ impl_resolver_singleton!(PEImage, FNameCtorWchar, |ctx| async {
             .map(|node| Self(*node.value));
     }
 
-    #[derive(Clone, Copy)]
     enum Tag {
         Direct,
         FirstCall,
     }
 
-    let refs = join_all(strings.iter().flatten().flat_map(|s| {
+    let refs = BinaryMatcher::tagged_capture_patterns(strings.into_iter().flat_map(|s| {
         [
             (
                 Tag::FirstCall,
-                format!("48 8d 15 X0x{s:x} 4c 8d 05 ?? ?? ?? ?? 41 b1 01 e8 | ?? ?? ?? ??"),
+                format!("48 8d 15 X0x{s:x} 4c 8d 05 ?? ?? ?? ?? 41 b1 01 e8 [ ?? ?? ?? ?? ]"),
             ),
             (
                 Tag::Direct,
-                format!("48 8d 15 X0x{s:x} 48 8d 0d ?? ?? ?? ?? e8 | ?? ?? ?? ??"),
+                format!("48 8d 15 X0x{s:x} 48 8d 0d ?? ?? ?? ?? e8 [ ?? ?? ?? ?? ]"),
             ),
             (
                 Tag::Direct,
                 format!(
-                    "41 b8 01 00 00 00 48 8d 15 X0x{s:x} 48 8d 0d ?? ?? ?? ?? e9 | ?? ?? ?? ??"
+                    "41 b8 01 00 00 00 48 8d 15 X0x{s:x} 48 8d 0d ?? ?? ?? ?? e9 [ ?? ?? ?? ?? ]"
                 ),
             ),
         ]
-        .into_iter()
-        .map(|(t, p)| scan_tagged2(ctx, t, Pattern::new(p).unwrap()))
-    }))
-    .await;
+    }))?
+    .resolve(ctx)
+    .await?;
 
-    Ok(Self(try_ensure_one(refs.iter().flatten().map(
-        |(tag, address)| {
-            let f = ctx.image().memory.rip4(*address)?;
-            match tag {
-                Tag::Direct => Ok(f),
-                Tag::FirstCall => {
-                    let bytes = ctx.image().memory.range(f..f + 0x200)?;
-                    let mut decoder = Decoder::with_ip(64, bytes, f, DecoderOptions::NONE);
+    // Keep thunk decoding lazy: native uniqueness checking can stop early.
+    Ok(Self(try_ensure_one(refs.iter().map(|node| {
+        let f = node.captures[0].rip4()?;
+        match node.tag.as_ref() {
+            Tag::Direct => Ok(f),
+            Tag::FirstCall => {
+                let bytes = ctx.image().memory.range(f..f + 0x200)?;
+                let mut decoder = Decoder::with_ip(64, bytes, f, DecoderOptions::NONE);
 
-                    decoder
-                        .iter()
-                        .find_map(|i| {
-                            (i.code() == Code::Call_rel32_64).then_some(i.memory_displacement64())
-                        })
-                        .context("did not find CALL instruction")
-                }
+                decoder
+                    .iter()
+                    .find_map(|i| {
+                        (i.code() == Code::Call_rel32_64).then_some(i.memory_displacement64())
+                    })
+                    .context("did not find CALL instruction")
             }
-        },
-    ))?))
+        }
+    }))?))
 });
 
 /// Can be either of the following:

@@ -70,19 +70,19 @@ fn multi_pattern_scan_accepts_empty_collections() {
     assert!(matches.is_empty());
 }
 
-fn blueprint_init_bytes(second_class_target: u64) -> Vec<u8> {
-    fn write_pattern(bytes: &mut [u8], offset: usize, signature: &str, targets: &[u64]) {
-        let pattern = Pattern::new(signature).unwrap();
-        let end = offset + pattern.simple.sig.len();
-        bytes[offset..end].copy_from_slice(&pattern.simple.sig);
-        assert_eq!(pattern.captures.len(), targets.len());
-        for (range, target) in pattern.captures.iter().zip(targets) {
-            let at = offset + range.start;
-            let displacement = i32::try_from(*target as i64 - (0x1000 + at + 4) as i64).unwrap();
-            bytes[at..at + 4].copy_from_slice(&displacement.to_le_bytes());
-        }
+fn write_pattern(bytes: &mut [u8], offset: usize, signature: &str, targets: &[u64]) {
+    let pattern = Pattern::new(signature).unwrap();
+    let end = offset + pattern.simple.sig.len();
+    bytes[offset..end].copy_from_slice(&pattern.simple.sig);
+    assert_eq!(pattern.captures.len(), targets.len());
+    for (range, target) in pattern.captures.iter().zip(targets) {
+        let at = offset + range.start;
+        let displacement = i32::try_from(*target as i64 - (0x1000 + at + 4) as i64).unwrap();
+        bytes[at..at + 4].copy_from_slice(&displacement.to_le_bytes());
     }
+}
 
+fn blueprint_init_bytes(second_class_target: u64) -> Vec<u8> {
     let mut bytes = vec![0x90; 0x1000];
     for (index, class_target) in [0x3000, second_class_target].into_iter().enumerate() {
         let string_offset = 0x800 + index * 0x100;
@@ -363,6 +363,128 @@ fn object_array_pipelines_reject_empty_unknown_and_conflicting_candidates() {
             .resolve(patternsleuth::resolvers::unreal::guobject_array::GUObjectArray::resolver())
             .unwrap_err();
 
+        assert_eq!(result.to_string(), upstream.to_string());
+    }
+}
+
+#[cfg(feature = "image-pe")]
+fn fname_ctor_bytes() -> Vec<u8> {
+    let mut bytes = vec![0x90; 0x1000];
+    for (offset, text) in [
+        (0x800, "TGPUSkinVertexFactoryUnlimited\0"),
+        (0x900, "MovementComponent0\0"),
+    ] {
+        let text = util::utf16(text);
+        bytes[offset..offset + text.len()].copy_from_slice(&text);
+    }
+    bytes
+}
+
+#[cfg(feature = "image-pe")]
+fn write_fname_ctor_reference(
+    bytes: &mut [u8],
+    offset: usize,
+    layout: usize,
+    string: u64,
+    target: u64,
+) {
+    let signatures = [
+        "48 8d 15 [ ?? ?? ?? ?? ] 4c 8d 05 ?? ?? ?? ?? 41 b1 01 e8 [ ?? ?? ?? ?? ]",
+        "48 8d 15 [ ?? ?? ?? ?? ] 48 8d 0d ?? ?? ?? ?? e8 [ ?? ?? ?? ?? ]",
+        "41 b8 01 00 00 00 48 8d 15 [ ?? ?? ?? ?? ] 48 8d 0d ?? ?? ?? ?? e9 [ ?? ?? ?? ?? ]",
+    ];
+    write_pattern(bytes, offset, signatures[layout], &[string, target]);
+}
+
+#[test]
+#[cfg(feature = "image-pe")]
+fn fname_ctor_capture_pipeline_preserves_prologue_and_inline_priority() {
+    let prologue = "48 89 5C 24 08 57 48 83 EC 30 48 8B D9 41 8B F8 33 C9 4C 8B DA 44 8B D1 4C 8B CA 48 85 D2 74 ?? 0F B7 02 66 85 C0";
+    let inline =
+        "EB 07 48 8D 15 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 41 B8 01 00 00 00 E8 [ ?? ?? ?? ?? ]";
+    for (prologues, calls, expected) in [(1, 1, Some(0x1100)), (0, 2, Some(0x3000)), (2, 1, None)] {
+        let mut bytes = fname_ctor_bytes();
+        for index in 0..prologues {
+            write_pattern(&mut bytes, 0x100 + index * 0x80, prologue, &[]);
+        }
+        for index in 0..calls {
+            write_pattern(&mut bytes, 0x300 + index * 0x80, inline, &[0x3000]);
+        }
+        // A lower-priority thunk must not be decoded when an earlier heuristic matches.
+        write_fname_ctor_reference(&mut bytes, 0x500, 0, 0x1800, 0x6000);
+        let image = pe_image(bytes);
+        let result = image.resolve(models::fname::FNameCtorWchar::resolver());
+        let upstream =
+            image.resolve(patternsleuth::resolvers::unreal::fname::FNameCtorWchar::resolver());
+
+        assert_eq!(result.as_ref().ok().map(|value| value.0), expected);
+        assert_eq!(
+            result.ok().map(|value| value.0),
+            upstream.ok().map(|value| value.0)
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "image-pe")]
+fn fname_ctor_capture_pipeline_matches_direct_jump_and_thunk_references() {
+    for layout in 0..3 {
+        let mut bytes = fname_ctor_bytes();
+        write_fname_ctor_reference(&mut bytes, 0x100, layout, 0x1800, 0x1400);
+        write_fname_ctor_reference(&mut bytes, 0x200, layout, 0x1900, 0x1400);
+        relative(&mut bytes, 0x400, &[0xe8], 0x1600);
+        let image = pe_image(bytes);
+        let result = image
+            .resolve(models::fname::FNameCtorWchar::resolver())
+            .unwrap();
+        let upstream = image
+            .resolve(patternsleuth::resolvers::unreal::fname::FNameCtorWchar::resolver())
+            .unwrap();
+
+        assert_eq!(result.0, upstream.0);
+        if layout != 0 {
+            assert_eq!(result.0, 0x1400);
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "image-pe")]
+fn fname_ctor_capture_pipeline_preserves_errors_and_lazy_uniqueness_limit() {
+    let mut no_call = fname_ctor_bytes();
+    write_fname_ctor_reference(&mut no_call, 0x100, 0, 0x1800, 0x1400);
+    let mut conflicting = fname_ctor_bytes();
+    write_fname_ctor_reference(&mut conflicting, 0x100, 1, 0x1800, 0x3000);
+    write_fname_ctor_reference(&mut conflicting, 0x200, 2, 0x1800, 0x4000);
+    let mut limited = fname_ctor_bytes();
+    for index in 0..4 {
+        write_fname_ctor_reference(
+            &mut limited,
+            0x100 + index * 0x40,
+            1,
+            0x1800,
+            0x3000 + index as u64 * 0x100,
+        );
+    }
+    write_fname_ctor_reference(&mut limited, 0x300, 0, 0x1900, 0x6000);
+    for (bytes, expected) in [
+        (fname_ctor_bytes(), "expected at least one value"),
+        (no_call, "did not find CALL instruction"),
+        (conflicting, "found 2 unique values"),
+        (limited, "found >=4 unique values"),
+    ] {
+        let image = pe_image(bytes);
+        let result = image
+            .resolve(models::fname::FNameCtorWchar::resolver())
+            .unwrap_err();
+        let upstream = image
+            .resolve(patternsleuth::resolvers::unreal::fname::FNameCtorWchar::resolver())
+            .unwrap_err();
+
+        assert!(
+            result.to_string().contains(expected),
+            "{result}; expected {expected}"
+        );
         assert_eq!(result.to_string(), upstream.to_string());
     }
 }
