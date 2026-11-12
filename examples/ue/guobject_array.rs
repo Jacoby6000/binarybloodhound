@@ -3,18 +3,17 @@
 use binary_bloodhound::BinaryMatcher;
 use futures::{future::join_all, join, try_join};
 
-use super::scan::{scan, scan_tagged};
-use patternsleuth::scanner::Pattern;
+use super::scan::scan_patterns;
 
 use super::util;
 use patternsleuth::{
-    Addressable, MemoryTrait,
+    MemoryTrait,
     resolvers::{Result, impl_resolver_singleton, try_ensure_one},
 };
 
 pub use super::models::objects::GUObjectArray;
 impl_resolver_singleton!(all, GUObjectArray, |ctx| async {
-    let patterns = [
+    let relative_patterns = [
         "8B 05 ?? ?? ?? ?? 3B 05 ?? ?? ?? ?? 75 ?? 48 8D 15 ?? ?? ?? ?? 48 8D 0D | ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8D 05",
         "74 ?? 48 8D 0D | ?? ?? ?? ?? C6 05 ?? ?? ?? ?? 01 E8 ?? ?? ?? ?? C6 05 ?? ?? ?? ?? 01",
         "75 ?? 48 ?? ?? 48 8D 0D | ?? ?? ?? ?? E8 ?? ?? ?? ?? 45 33 C9 4C 89 74 24",
@@ -23,7 +22,7 @@ impl_resolver_singleton!(all, GUObjectArray, |ctx| async {
         "E8 ?? ?? ?? ?? 8B 05 ?? ?? ?? ?? 8B 0D ?? ?? ?? ?? 03 0D | ?? ?? ?? ?? 29 C8 87 05",
     ];
     // mov imm32 pattern for linux
-    let patterns1 = [
+    let immediate_patterns = [
         /*
         06f97b32 41  39  ee       CMP        R14D ,EBP
         06f97b35 0f  8e  7e       JLE        LAB_06f97cb9
@@ -56,39 +55,27 @@ impl_resolver_singleton!(all, GUObjectArray, |ctx| async {
     ];
     // `ObjObjects.Num() - ObjFirstGCIndex - <available count>` inlined into a stat update.
     // order and spacing depends on version so capture all three and match against known spacings
-    let num_minus_available =
-        Pattern::new("8B 05 [ ?? ?? ?? ?? ] 2B 05 [ ?? ?? ?? ?? ] 2B 05 [ ?? ?? ?? ?? ]").unwrap();
+    let num_minus_available = BinaryMatcher::capture_patterns([
+        "8B 05 [ ?? ?? ?? ?? ] 2B 05 [ ?? ?? ?? ?? ] 2B 05 [ ?? ?? ?? ?? ]",
+    ])?
+    .try_map_filter(|node| {
+        let caps = &node.captures;
+        let mut operands = [caps[0].rip4()?, caps[1].rip4()?, caps[2].rip4()?];
+        operands.sort_unstable();
+        Ok(base_from_operands(operands))
+    });
 
-    let (res0, res1, res2) = join!(
-        join_all(patterns.iter().map(|p| scan(ctx, Pattern::new(p).unwrap()))),
-        join_all(
-            patterns1
-                .iter()
-                .map(|p| scan(ctx, Pattern::new(p).unwrap()))
-        ),
-        scan_tagged(ctx, (), num_minus_available),
+    let (relative_addresses, immediate_addresses, layout_bases) = join!(
+        scan_patterns(ctx, relative_patterns),
+        scan_patterns(ctx, immediate_patterns),
+        num_minus_available.resolve(ctx),
     );
 
-    let res1 = res1
+    // Preserve upstream's eager layout validation before lazy address decoding.
+    let layout_bases = layout_bases?;
+    let immediate_bases = immediate_addresses
         .iter()
-        .flatten()
         .map(|a| -> Result<_> { Ok(ctx.image().memory.u32_le(*a)? as u64) });
-
-    let res2 = res2
-        .2
-        .iter()
-        .map(|a| -> Result<_> {
-            let Some(caps) = ctx.image().memory.captures(&res2.1, *a)? else {
-                return Ok(None);
-            };
-            let mut operands = [caps[0].rip(), caps[1].rip(), caps[2].rip()];
-            operands.sort_unstable();
-            Ok(base_from_operands(operands))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .map(Ok);
 
     /// Given the three ascending operand addresses, return the `FUObjectArray` base they belong to
     fn base_from_operands(operands: [u64; 3]) -> Option<u64> {
@@ -105,11 +92,11 @@ impl_resolver_singleton!(all, GUObjectArray, |ctx| async {
     }
 
     Ok(Self(try_ensure_one(
-        res0.iter()
-            .flatten()
+        relative_addresses
+            .iter()
             .map(|a| -> Result<_> { Ok(ctx.image().memory.rip4(*a)?) })
-            .chain(res1)
-            .chain(res2),
+            .chain(immediate_bases)
+            .chain(layout_bases.iter().map(|node| Ok(*node.value))),
     )?))
 });
 
