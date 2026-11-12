@@ -1,4 +1,80 @@
 #[test]
+fn find_map_retains_only_the_selected_non_clone_candidate_as_parent() {
+    struct Source(u64);
+    struct Output(u64);
+    let matcher: Matcher<_, _, ExactlyOne, _> =
+        Matcher::items::<Source>().find_map(|node| match node.value.0 {
+            0 => None,
+            1 => Some(Output(10)),
+            _ => panic!("first match must skip later callbacks"),
+        });
+    let node = run_nodes(
+        &scan_image(),
+        matcher,
+        vec![Source(0), Source(1), Source(2)],
+    )
+    .unwrap();
+
+    assert_eq!(node.value.0, 10);
+    assert_eq!(node.parent().value.0, 1);
+    assert_eq!(node.parents().len(), 1);
+}
+
+#[test]
+fn context_try_find_map_stops_at_first_error() {
+    let matcher = BinaryMatcher::candidates([0, 1, 2])
+        .with_context()
+        .try_find_map(|(ctx, node)| -> Result<Option<u64>> {
+            assert_eq!(ctx.image().base_address, BASE);
+            match *node.value {
+                0 => Ok(None),
+                1 => Err(ResolveError::new_msg("selection failed")),
+                _ => panic!("first error must skip later callbacks"),
+            }
+        });
+    let error = run_nodes(&scan_image(), matcher, ()).unwrap_err();
+
+    assert_eq!(error.to_string(), "selection failed");
+}
+
+#[test]
+fn find_map_rejects_empty_input_and_no_matching_candidate() {
+    for addresses in [vec![], vec![1, 2]] {
+        let matcher = BinaryMatcher::candidates(addresses).find_map(|_| None::<u64>);
+        let error = run_nodes(&scan_image(), matcher, ()).unwrap_err();
+
+        assert_eq!(error.to_string(), "no candidate matched");
+    }
+}
+
+#[test]
+fn find_map_does_not_hide_upstream_errors_or_skip_upstream_work() {
+    let matcher = BinaryMatcher::candidates([1, 2])
+        .try_map(|node| {
+            if *node.value == 2 {
+                Err(ResolveError::new_msg("upstream failed"))
+            } else {
+                Ok(*node.value)
+            }
+        })
+        .find_map(|_| -> Option<u64> { panic!("upstream error must skip selection") });
+    let error = run_nodes(&scan_image(), matcher, ()).unwrap_err();
+
+    assert_eq!(error.to_string(), "upstream failed");
+}
+
+#[test]
+fn context_find_map_passes_context_and_returns_to_data_only_callbacks() {
+    let matcher = BinaryMatcher::candidates([1, 2, 3])
+        .with_context()
+        .find_map(|(ctx, node)| (*node.value == 2).then_some(ctx.image().base_address))
+        .map(|node| (*node.value, *node.parent().value));
+    let node = run_nodes(&scan_image(), matcher, ()).unwrap();
+
+    assert_eq!(*node.value, (BASE, 2));
+}
+
+#[test]
 fn ensure_non_empty_retains_non_clone_values_duplicates_and_ancestry() {
     struct Source(u64);
     let original = run_nodes(

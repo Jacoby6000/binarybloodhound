@@ -204,6 +204,40 @@ impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope,
         self.with_context()
             .try_map_filter(move |(_, node)| func(node))
     }
+
+    /// Return the first Some replacement, retaining its original node as parent.
+    /// Error if no candidate matches. Only this callback short-circuits: all
+    /// upstream stages finish before it runs.
+    pub fn find_map<T: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, T, ExactlyOne, Trace<O, P>>
+    where
+        F: Fn(&Trace<O, P>) -> Option<T> + Send + Sync + 'scope,
+    {
+        self.try_find_map(move |node| Ok(func(node)))
+    }
+
+    /// Visit candidates in order until Some or the first error. Do not invoke
+    /// the callback on later candidates. Error if every callback returns None.
+    /// Upstream scanning and transformations still run to completion first.
+    ///
+    /// ```
+    /// use binary_bloodhound::BinaryMatcher;
+    /// let matcher = BinaryMatcher::candidates([1, 2, 3]).try_find_map(|node| {
+    ///     Ok((*node.value == 2).then_some(*node.value * 10))
+    /// });
+    /// ```
+    pub fn try_find_map<T: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, T, ExactlyOne, Trace<O, P>>
+    where
+        F: Fn(&Trace<O, P>) -> Result<Option<T>> + Send + Sync + 'scope,
+    {
+        self.with_context()
+            .try_find_map(move |(_, node)| func(node))
+    }
     pub fn filter_modify<T: Send + Sync + 'scope, F>(
         self,
         func: F,

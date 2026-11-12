@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use patternsleuth::resolvers::Result;
+use patternsleuth::resolvers::{ResolveError, Result};
 
 use crate::{Cardinality, ExactlyOne, MatchContext, Matcher, Trace, Variable};
 
@@ -44,6 +44,33 @@ impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope,
         F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<Option<U>> + Send + Sync + 'scope,
     {
         self.try_expand_values(func)
+    }
+
+    pub fn find_map<U: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, ExactlyOne, Trace<O, P>>
+    where
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Option<U> + Send + Sync + 'scope,
+    {
+        self.try_find_map(move |input| Ok(func(input)))
+    }
+
+    pub fn try_find_map<U: Send + Sync + 'scope, F>(
+        self,
+        func: F,
+    ) -> Matcher<'scope, I, U, ExactlyOne, Trace<O, P>>
+    where
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<Option<U>> + Send + Sync + 'scope,
+    {
+        self.matcher.transform_nodes(move |(ctx, nodes)| {
+            for node in nodes {
+                if let Some(value) = func((ctx, &node))? {
+                    return Ok(vec![Trace::child(value, Arc::new(node))]);
+                }
+            }
+            Err(ResolveError::new_msg("no candidate matched"))
+        })
     }
     pub fn filter_modify<U: Send + Sync + 'scope, F>(
         self,
