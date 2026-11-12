@@ -229,6 +229,32 @@ fn object_image(message: &str, wide: bool) -> Image<'static> {
 }
 
 #[test]
+fn console_manager_pipeline_matches_upstream_with_both_string_anchors() {
+    let first = util::utf16("r.DumpingMovie");
+    let second = util::utf16("vr.pixeldensity");
+    let mut bytes = vec![0x90; 256];
+    relative(&mut bytes, 0, &[0x48, 0x8d, 0x15], 0x1100);
+    relative(
+        &mut bytes,
+        16,
+        &[0x48, 0x8d, 0x15],
+        0x1100 + first.len() as u64,
+    );
+    bytes.extend(first);
+    bytes.extend(second);
+    let image = object_image("", true).with_text(bytes).unwrap();
+    let result = image
+        .resolve(models::engine::ConsoleManagerSingleton::resolver())
+        .unwrap();
+    let upstream = image
+        .resolve(patternsleuth::resolvers::unreal::ConsoleManagerSingleton::resolver())
+        .unwrap();
+
+    assert_eq!(result.0, upstream.0);
+    assert_eq!(result.0, 0x1000);
+}
+
+#[test]
 fn object_allocation_pipeline_matches_upstream_for_both_encodings() {
     for wide in [false, true] {
         let image = object_image(

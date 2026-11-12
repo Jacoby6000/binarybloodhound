@@ -30,21 +30,16 @@ use patternsleuth::resolvers::{DynResolverFactory, impl_resolver_singleton};
 
 pub use models::engine::ConsoleManagerSingleton;
 impl_resolver_singleton!(all, ConsoleManagerSingleton, |ctx| async {
-    let strings = BinaryMatcher::patterns([
+    let address = BinaryMatcher::patterns([
         util::utf16_pattern("r.DumpingMovie"),
         util::utf16_pattern("vr.pixeldensity"),
     ])?
+    .try_flat_map(|address| BinaryMatcher::patterns([format!("48 8d 15 X0x{:x}", *address.value)]))
+    .root_functions()
+    .addresses()
+    .ensure_one()
     .resolve(ctx)
     .await?;
-    let patterns = strings
-        .into_iter()
-        .map(|address| format!("48 8d 15 X0x{:x}", *address.value));
-    let address = BinaryMatcher::patterns(patterns)?
-        .root_functions()
-        .addresses()
-        .ensure_one()
-        .resolve(ctx)
-        .await?;
     Ok(Self(*address.value))
 });
 
