@@ -22,6 +22,7 @@
 //! }
 //! ```
 
+mod captures;
 mod cardinality;
 mod composition;
 mod context;
@@ -35,6 +36,7 @@ mod provenance;
 mod sets;
 mod sources;
 
+pub use captures::{Capture, PatternMatch};
 pub use cardinality::{Cardinality, ExactlyOne, Variable};
 pub use composition::{ForkMatcher, ForkOutput, SequenceParents};
 pub use context::WithContext;

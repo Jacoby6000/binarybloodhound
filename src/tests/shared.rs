@@ -1,6 +1,7 @@
 use super::*;
 use iced_x86::FlowControl;
 include!("provenance.rs");
+include!("captures.rs");
 include!("walk_disassembly.rs");
 use object::SectionKind;
 use patternsleuth::{

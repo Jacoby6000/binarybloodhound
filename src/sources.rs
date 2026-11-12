@@ -6,7 +6,9 @@ use patternsleuth::{
     scanner::Pattern,
 };
 
-use crate::{BinaryMatcher, ExactlyOne, MatchContext, Matcher, Trace, Variable, pipeline::Run};
+use crate::{
+    BinaryMatcher, ExactlyOne, MatchContext, Matcher, PatternMatch, Trace, Variable, pipeline::Run,
+};
 
 struct AsyncSource<F>(F);
 impl<I: Send, O: Send + Sync, F> Run<I, Trace<O>> for AsyncSource<F>
@@ -49,6 +51,43 @@ where
         O: 'ctx,
     {
         Box::pin(async move { (self.0)(input) })
+    }
+}
+
+struct CapturedPatterns<Tag> {
+    patterns: Vec<(Arc<Tag>, Arc<Pattern>)>,
+}
+
+impl<Tag: Send + Sync> Run<(), Trace<PatternMatch<Tag>>> for CapturedPatterns<Tag> {
+    fn run<'ctx, 'image>(
+        &'ctx self,
+        (): (),
+        ctx: MatchContext<'ctx, 'image>,
+    ) -> BoxFuture<'ctx, Result<Vec<Trace<PatternMatch<Tag>>>>>
+    where
+        (): 'ctx,
+        Trace<PatternMatch<Tag>>: 'ctx,
+    {
+        Box::pin(async move {
+            let results = join_all(
+                self.patterns
+                    .iter()
+                    .map(|(_, pattern)| ctx.scan(pattern.as_ref().clone())),
+            )
+            .await;
+            let mut matches = Vec::new();
+            for ((tag, pattern), addresses) in self.patterns.iter().zip(results) {
+                for address in addresses {
+                    matches.push(Trace::root(PatternMatch::read(
+                        ctx.image(),
+                        address,
+                        Arc::clone(pattern),
+                        Arc::clone(tag),
+                    )?));
+                }
+            }
+            Ok(matches)
+        })
     }
 }
 
@@ -154,6 +193,12 @@ fn parse_signature(signature: impl AsRef<str>) -> Result<Pattern> {
     Pattern::new(signature).map_err(|error| ResolveError::new_msg(format!("{error:#}")))
 }
 
+fn parse_indexed_pattern(index: usize, pattern: impl IntoPattern) -> Result<Pattern> {
+    pattern.into_pattern().map_err(|error| {
+        ResolveError::new_msg(format!("invalid pattern at index {index}: {error}"))
+    })
+}
+
 impl<'scope> BinaryMatcher<'scope> {
     pub fn pattern(pattern: Pattern) -> Self {
         Self::scan_patterns(vec![pattern])
@@ -171,13 +216,44 @@ impl<'scope> BinaryMatcher<'scope> {
         let patterns = patterns
             .into_iter()
             .enumerate()
-            .map(|(index, pattern)| {
-                pattern.into_pattern().map_err(|error| {
-                    ResolveError::new_msg(format!("invalid pattern at index {index}: {error}"))
-                })
-            })
+            .map(|(index, pattern)| parse_indexed_pattern(index, pattern))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self::scan_patterns(patterns))
+    }
+
+    /// Scan patterns with owned capture bytes and shared pattern metadata.
+    /// Preserve pattern order, match order, and duplicates. Scan and copy captures
+    /// before downstream callbacks run; complete patterns must fit active bounds.
+    ///
+    /// ```
+    /// use binary_bloodhound::BinaryMatcher;
+    /// let matcher = BinaryMatcher::capture_patterns(["E8 [ ?? ?? ?? ?? ]"])?
+    ///     .try_map(|node| node.captures[0].rip4());
+    /// # Ok::<(), patternsleuth::resolvers::ResolveError>(())
+    /// ```
+    pub fn capture_patterns<P: IntoPattern>(
+        patterns: impl IntoIterator<Item = P>,
+    ) -> Result<Matcher<'scope, (), PatternMatch>> {
+        Self::tagged_capture_patterns(patterns.into_iter().map(|pattern| ((), pattern)))
+    }
+
+    /// Capture-aware sources with user tags. Parse once, reporting invalid
+    /// signatures by zero-based index. Tags may be borrowed and need not be Clone.
+    /// Captures are owned snapshots, so they can escape the image's lifetime.
+    pub fn tagged_capture_patterns<Tag: Send + Sync + 'scope, P: IntoPattern>(
+        patterns: impl IntoIterator<Item = (Tag, P)>,
+    ) -> Result<Matcher<'scope, (), PatternMatch<Tag>>> {
+        let patterns = patterns
+            .into_iter()
+            .enumerate()
+            .map(|(index, (tag, pattern))| {
+                Ok((
+                    Arc::new(tag),
+                    Arc::new(parse_indexed_pattern(index, pattern)?),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Matcher::from_run(CapturedPatterns { patterns }))
     }
 
     fn scan_patterns(patterns: Vec<Pattern>) -> Self {

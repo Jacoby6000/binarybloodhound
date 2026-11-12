@@ -23,7 +23,7 @@ jobs:
       - name: Check formatting
         run: |
           cargo fmt --all -- --check
-          rustfmt --check src/tests/{shared,provenance,walk_disassembly}.rs
+          rustfmt --check src/tests/{shared,provenance,captures,walk_disassembly}.rs
 
   check:
     name: Check (${{ matrix.name }})
