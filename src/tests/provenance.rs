@@ -1,4 +1,58 @@
 #[test]
+fn ensure_non_empty_retains_non_clone_values_duplicates_and_ancestry() {
+    struct Source(u64);
+    let original = run_nodes(
+        &scan_image(),
+        Matcher::items::<Source>(),
+        vec![Source(7), Source(7)],
+    )
+    .unwrap();
+    let matcher: Matcher<_, _, Variable, _> = Matcher::from_nodes(&original).ensure_non_empty();
+    let nodes = run_nodes(&scan_image(), matcher, ()).unwrap();
+
+    assert_eq!(nodes.len(), 2);
+    for (node, original) in nodes.iter().zip(&original) {
+        assert_eq!(node.value.0, 7);
+        assert!(std::sync::Arc::ptr_eq(&node.value, &original.value));
+        assert!(std::sync::Arc::ptr_eq(
+            &node.parents()[0],
+            &original.parents()[0]
+        ));
+    }
+}
+
+#[test]
+fn ensure_non_empty_preserves_exactly_one_cardinality() {
+    struct Source(u64);
+    let matcher: Matcher<_, _, ExactlyOne, _> = Matcher::new::<Source>().ensure_non_empty();
+    let node = run_nodes(&scan_image(), matcher, Source(7)).unwrap();
+
+    assert_eq!(node.value.0, 7);
+    assert_eq!(node.parent(), &());
+}
+
+#[test]
+fn ensure_non_empty_rejects_empty_output_before_downstream_transforms() {
+    let matcher = BinaryMatcher::candidates([])
+        .ensure_non_empty()
+        .transform(|_| -> u64 { panic!("empty output must skip downstream callbacks") });
+    let error = run_nodes(&scan_image(), matcher, ()).unwrap_err();
+
+    assert_eq!(error.to_string(), "expected at least one value");
+}
+
+#[test]
+fn ensure_non_empty_preserves_upstream_errors() {
+    let matcher = Matcher::from_sync(|()| -> Result<Vec<u64>> {
+        Err(ResolveError::new_msg("source failed"))
+    })
+    .ensure_non_empty();
+    let error = run_nodes(&scan_image(), matcher, ()).unwrap_err();
+
+    assert_eq!(error.to_string(), "source failed");
+}
+
+#[test]
 fn sources_always_start_typed_ancestry() {
     let node: Trace<u64> =
         run_nodes(&scan_image(), BinaryMatcher::address(42).first(), ()).unwrap();

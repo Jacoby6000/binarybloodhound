@@ -335,6 +335,22 @@ impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope,
             Ok(merge_items(nodes))
         })
     }
+
+    /// Require at least one candidate, retaining cardinality, order, and ancestry.
+    /// Equal values remain separate candidates; values need no comparison traits.
+    ///
+    /// ```
+    /// use binary_bloodhound::BinaryMatcher;
+    /// let matcher = BinaryMatcher::candidates([0x1000, 0x1000]).ensure_non_empty();
+    /// ```
+    pub fn ensure_non_empty(self) -> Self {
+        self.transform_nodes(|(_, nodes)| {
+            if nodes.is_empty() {
+                return Err(ResolveError::new_msg("expected at least one value"));
+            }
+            Ok(nodes)
+        })
+    }
 }
 
 impl<'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope, C: Cardinality>
