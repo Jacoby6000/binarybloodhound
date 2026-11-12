@@ -96,30 +96,90 @@ impl<'ctx, 'image> MatchContext<'ctx, 'image> {
             .iter()
             .copied()
             .chain(indirect.into_iter().flatten())
-            .flat_map(|address| {
-                if calls {
-                    return vec![format!("e8 X0x{address:X}"), format!("e9 X0x{address:X}")];
-                }
-                let mut patterns = [
-                    "48 8d 05", "48 8d 0d", "48 8d 15", "48 8d 1d", "48 8d 25", "48 8d 2d",
-                    "48 8d 35", "48 8d 3d", "4c 8d 05", "4c 8d 0d", "4c 8d 15", "4c 8d 1d",
-                    "4c 8d 25", "4c 8d 2d", "4c 8d 35", "4c 8d 3d",
-                ]
-                .map(|lea| format!("{lea} X0x{address:X}"))
-                .to_vec();
-                if u32::try_from(address).is_ok() {
-                    patterns.extend(
-                        ["b8", "b9", "ba", "bb", "bc", "bd", "be", "bf"]
-                            .map(|opcode| format!("{opcode} 0x{address:X}")),
-                    );
-                }
-                patterns
-            })
-            .map(|signature| Pattern::new(signature).unwrap());
+            .flat_map(|address| reference_patterns(address, calls));
         join_all(patterns.map(|pattern| self.scan(pattern)))
             .await
             .into_iter()
             .flatten()
             .collect()
+    }
+}
+
+fn reference_patterns(address: u64, calls: bool) -> impl Iterator<Item = Pattern> {
+    let signatures = if calls {
+        vec![format!("e8 X0x{address:X}"), format!("e9 X0x{address:X}")]
+    } else {
+        // REX.W and REX.W|R, each with the eight RIP-relative LEA destinations.
+        let mut signatures: Vec<_> = [0x48, 0x4c]
+            .into_iter()
+            .flat_map(|rex| {
+                (0..8).map(move |register| {
+                    let modrm = 0x05 + register * 8;
+                    format!("{rex:02X} 8D {modrm:02X} X0x{address:X}")
+                })
+            })
+            .collect();
+        if u32::try_from(address).is_ok() {
+            signatures.extend((0xb8..=0xbf).map(|opcode| format!("{opcode:02X} 0x{address:X}")));
+        }
+        signatures
+    };
+    signatures
+        .into_iter()
+        .map(|signature| Pattern::new(signature).expect("generated reference pattern"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reference_patterns;
+
+    #[test]
+    fn data_reference_patterns_cover_lea_registers_in_native_order() {
+        let address = 0x1_4000_4000_u64;
+        let patterns: Vec<_> = reference_patterns(address, false).collect();
+
+        assert_eq!(patterns.len(), 16);
+        for (index, pattern) in patterns.iter().enumerate() {
+            let mut instruction = vec![
+                if index < 8 { 0x48 } else { 0x4c },
+                0x8d,
+                0x05 + (index % 8) as u8 * 8,
+            ];
+            instruction.extend(0_i32.to_le_bytes());
+
+            assert!(pattern.is_match(&instruction, (address - 7) as usize, 0));
+        }
+    }
+
+    #[test]
+    fn data_reference_patterns_include_immediates_only_for_u32_addresses() {
+        let address = u32::MAX;
+        let patterns: Vec<_> = reference_patterns(u64::from(address), false).collect();
+
+        assert_eq!(patterns.len(), 24);
+        for (index, pattern) in patterns[16..].iter().enumerate() {
+            let mut instruction = vec![0xb8 + index as u8];
+            instruction.extend(address.to_le_bytes());
+
+            assert!(pattern.is_match(&instruction, 0, 0));
+        }
+        assert_eq!(
+            reference_patterns(u64::from(address) + 1, false).count(),
+            16
+        );
+    }
+
+    #[test]
+    fn call_reference_patterns_cover_direct_calls_then_jumps() {
+        let address = 0x1_4000_4000;
+        let patterns: Vec<_> = reference_patterns(address, true).collect();
+
+        assert_eq!(patterns.len(), 2);
+        for (pattern, opcode) in patterns.iter().zip([0xe8, 0xe9]) {
+            let mut instruction = vec![opcode];
+            instruction.extend(0_i32.to_le_bytes());
+
+            assert!(pattern.is_match(&instruction, (address - 5) as usize, 0));
+        }
     }
 }
