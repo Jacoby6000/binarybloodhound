@@ -1,15 +1,16 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/blueprint_library.rs>
 
-use binary_bloodhound::BinaryMatcher;
-use futures::{future::join_all, join};
+use binary_bloodhound::{BinaryMatcher, Matcher};
+use futures::join;
 
-use super::scan::{scan, scan_tagged};
 use super::util;
+#[cfg(feature = "image-pe")]
+use patternsleuth::resolvers::ensure_one;
 use patternsleuth::scanner::Pattern;
 
 use patternsleuth::{
     Addressable,
-    resolvers::{Context, ensure_one, impl_resolver, impl_resolver_singleton},
+    resolvers::{Context, impl_resolver, impl_resolver_singleton},
 };
 
 pub use super::models::blueprint::BlueprintLibraryInit;
@@ -17,13 +18,17 @@ pub use super::models::blueprint::BlueprintLibraryInit;
 impl_resolver!(all, BlueprintLibraryInit, |ctx| async {
     let mem = &ctx.image().memory;
 
-    let class_str = scan(ctx, util::utf16_pattern("UKismetStringTableLibrary\0")).await;
+    let class_str = BinaryMatcher::pattern(util::utf16_pattern("UKismetStringTableLibrary\0"))
+        .resolve(ctx)
+        .await?;
 
     let pattern_dyn_init_class = |s: u64| {
-        Pattern::new(format!("41 b9 ?? ?? ?? ?? 48 8d 15 X0x{s:x} 41 b8 28 00 00 00 48 8d 0d [ ?? ?? ?? ?? ] e9 [ ?? ?? ?? ?? ]")).unwrap()
+        format!(
+            "41 b9 ?? ?? ?? ?? 48 8d 15 X0x{s:x} 41 b8 28 00 00 00 48 8d 0d [ ?? ?? ?? ?? ] e9 [ ?? ?? ?? ?? ]"
+        )
     };
     let pattern_dyn_init_object = |s: u64| {
-        Pattern::new(format!(
+        format!(
             "
                 48 83 ec 48
                 33 c0
@@ -38,8 +43,7 @@ impl_resolver!(all, BlueprintLibraryInit, |ctx| async {
                 48 83 c4 48
                 c3
             "
-        ))
-        .unwrap()
+        )
     };
 
     let construct_uclass_pattern = Pattern::new(
@@ -58,33 +62,24 @@ impl_resolver!(all, BlueprintLibraryInit, |ctx| async {
     )
     .unwrap();
 
-    let (init_class_refs, init_object_refs) = join!(
-        join_all(
-            class_str
-                .iter()
-                .map(|s| scan_tagged(ctx, (), pattern_dyn_init_class(*s)))
-        ),
-        join_all(
-            class_str
-                .iter()
-                .map(|s| scan_tagged(ctx, (), pattern_dyn_init_object(*s)))
-        )
-    );
+    let init_class = Matcher::from_nodes(&class_str)
+        .try_flat_map(|node| BinaryMatcher::capture_patterns([pattern_dyn_init_class(*node.value)]))
+        .try_map(|node| node.captures[1].rip4())
+        .ensure_one();
+    let init_object = Matcher::from_nodes(&class_str)
+        .try_flat_map(|node| {
+            BinaryMatcher::capture_patterns([pattern_dyn_init_object(*node.value)])
+        })
+        .try_map(|node| {
+            let caps = &node.captures;
+            Ok((caps[0].rip4()?, caps[1].rip4()?, caps[2].rip4()?))
+        })
+        .ensure_one();
+    let (init_class, init_object) = join!(init_class.resolve(ctx), init_object.resolve(ctx));
 
-    let uclass_compiled_in_defer =
-        ensure_one(init_class_refs.into_iter().flat_map(|(_, p, a)| {
-            a.into_iter()
-                .flat_map(move |a| mem.captures(&p, a).ok().flatten().map(|c| c[1].rip()))
-        }))?;
+    let uclass_compiled_in_defer = *init_class?.value;
     let (get_private_static_class_wrapper, construct_uclass_wrapper, uobject_compiled_in_defer) =
-        ensure_one(init_object_refs.into_iter().flat_map(|(_, p, a)| {
-            a.into_iter().flat_map(move |a| {
-                mem.captures(&p, a)
-                    .ok()
-                    .flatten()
-                    .map(|c| (c[0].rip(), c[1].rip(), c[2].rip()))
-            })
-        }))?;
+        *init_object?.value;
 
     let construct_uclass = mem
         .captures(&construct_uclass_pattern, construct_uclass_wrapper)?
