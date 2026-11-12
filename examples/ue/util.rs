@@ -8,14 +8,7 @@ pub use patternsleuth::resolvers::unreal::util::{
 };
 
 pub async fn string_pattern(ctx: &AsyncContext<'_>, string: &str) -> Vec<u64> {
-    BinaryMatcher::patterns([utf16_pattern(string), utf8_pattern(string)])
-        .expect("literal patterns")
-        .resolve(ctx)
-        .await
-        .expect("pattern scan")
-        .into_iter()
-        .map(|node| *node.value)
-        .collect()
+    super::scan::scan_patterns(ctx, [utf16_pattern(string), utf8_pattern(string)]).await
 }
 
 pub async fn scan_xrefs(

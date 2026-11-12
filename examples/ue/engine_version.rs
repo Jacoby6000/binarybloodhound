@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use futures::future::join_all;
 
-use super::scan::{scan, scan_tagged};
+use super::scan::{scan, scan_patterns, scan_tagged};
 use binary_bloodhound::BinaryMatcher;
 use itertools::Itertools;
 use patternsleuth::scanner::Pattern;
@@ -86,21 +86,17 @@ async fn scan_version_stores(ctx: &AsyncContext<'_>) -> Vec<EngineVersion> {
     use patternsleuth::disassemble::disassemble_single;
 
     // the `66` is the operand size prefix of the `Patch` store that must follow
-    let patterns = MOV_RM32_IMM32
-        .iter()
-        .flat_map(|s| {
-            [
-                format!("{s} 0? 00 ?? 00 66"),
-                format!("41 {s} 0? 00 ?? 00 66"),
-            ]
-        })
-        .collect_vec();
+    let patterns = MOV_RM32_IMM32.iter().flat_map(|s| {
+        [
+            format!("{s} 0? 00 ?? 00 66"),
+            format!("41 {s} 0? 00 ?? 00 66"),
+        ]
+    });
 
-    let res = join_all(patterns.iter().map(|p| scan(ctx, Pattern::new(p).unwrap()))).await;
+    let res = scan_patterns(ctx, patterns).await;
 
     let img = ctx.image();
     res.iter()
-        .flatten()
         .filter_map(|&addr| {
             let store = disassemble_single(img, addr).ok()??;
             if store.code() != Code::Mov_rm32_imm32 || store.op0_kind() != OpKind::Memory {
@@ -160,16 +156,10 @@ async fn scan_version_stores(ctx: &AsyncContext<'_>) -> Vec<EngineVersion> {
 }
 
 async fn scan_version_pattern_matches(ctx: &AsyncContext<'_>) -> Vec<EngineVersion> {
-    let res = join_all(
-        VERSION_PATTERNS
-            .iter()
-            .map(|p| scan(ctx, Pattern::new(p).unwrap())),
-    )
-    .await;
+    let res = scan_patterns(ctx, VERSION_PATTERNS).await;
 
     let mem = &ctx.image().memory;
     res.iter()
-        .flatten()
         .filter_map(|a| {
             Some(EngineVersion {
                 major: mem.u16_le(*a).ok()?,
@@ -187,11 +177,10 @@ async fn scan_engine_version_string(ctx: &AsyncContext<'_>) -> Vec<EngineVersion
         "00 00 | 0011???? 00 2E 00 0011???? 00 2E 00",
         "00 00 | 0011???? 00 2E 00 0011???? 00 0011???? 00 2E 00",
     ];
-    let res = join_all(patterns.iter().map(|p| scan(ctx, Pattern::new(p).unwrap()))).await;
+    let res = scan_patterns(ctx, patterns).await;
 
     let mem = &ctx.image().memory;
     res.iter()
-        .flatten()
         .filter_map(|&a| {
             let s = mem.read_wstring(a).ok()?;
             let (major, rest) = s.split_once('.')?;
