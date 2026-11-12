@@ -1,19 +1,15 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/engine_version.rs>
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
-use futures::future::join_all;
-
-use super::scan::{scan, scan_patterns, scan_tagged};
-use binary_bloodhound::BinaryMatcher;
+use binary_bloodhound::{BinaryMatcher, ExactlyOne, Matcher, Trace, Variable};
 use itertools::Itertools;
 use patternsleuth::scanner::Pattern;
 
 use super::util;
-use patternsleuth::resolvers::ensure_one;
 use patternsleuth::{
     Addressable as _, MemoryTrait,
-    resolvers::{AsyncContext, ResolveError, bail_out, impl_resolver, impl_resolver_singleton},
+    resolvers::{ResolveError, Result, bail_out, impl_resolver, impl_resolver_singleton},
 };
 
 pub use super::models::version::EngineVersion;
@@ -81,7 +77,15 @@ fn plausible(ver: &EngineVersion) -> bool {
     }
 }
 
-async fn scan_version_stores(ctx: &AsyncContext<'_>) -> Vec<EngineVersion> {
+type VersionMatcher = Matcher<'static, (), EngineVersion, Variable, Trace<u64>>;
+
+// Resolver outputs are newly produced nodes, not shared input candidates.
+fn into_value<T, P>(node: Trace<T, P>) -> Result<T> {
+    Arc::try_unwrap(node.value)
+        .map_err(|_| ResolveError::new_msg("resolver output unexpectedly shared"))
+}
+
+fn version_stores() -> VersionMatcher {
     use iced_x86::{Code, Instruction, OpKind};
     use patternsleuth::disassemble::disassemble_single;
 
@@ -93,11 +97,12 @@ async fn scan_version_stores(ctx: &AsyncContext<'_>) -> Vec<EngineVersion> {
         ]
     });
 
-    let res = scan_patterns(ctx, patterns).await;
-
-    let img = ctx.image();
-    res.iter()
-        .filter_map(|&addr| {
+    BinaryMatcher::patterns(patterns)
+        .expect("valid version-store patterns")
+        .with_context()
+        .map_filter(|(ctx, node)| {
+            let img = ctx.image();
+            let addr = *node.value;
             let store = disassemble_single(img, addr).ok()??;
             if store.code() != Code::Mov_rm32_imm32 || store.op0_kind() != OpKind::Memory {
                 return None;
@@ -152,37 +157,35 @@ async fn scan_version_stores(ctx: &AsyncContext<'_>) -> Vec<EngineVersion> {
             })
         })
         .filter(|ver| plausible(ver) && ver.minor != 0)
-        .collect()
 }
 
-async fn scan_version_pattern_matches(ctx: &AsyncContext<'_>) -> Vec<EngineVersion> {
-    let res = scan_patterns(ctx, VERSION_PATTERNS).await;
-
-    let mem = &ctx.image().memory;
-    res.iter()
-        .filter_map(|a| {
+fn version_pattern_matches() -> VersionMatcher {
+    BinaryMatcher::patterns(VERSION_PATTERNS)
+        .expect("valid version patterns")
+        .with_context()
+        .map_filter(|(ctx, node)| {
+            let mem = &ctx.image().memory;
+            let address = *node.value;
             Some(EngineVersion {
-                major: mem.u16_le(*a).ok()?,
-                minor: mem.u16_le(a + 2).ok()?,
+                major: mem.u16_le(address).ok()?,
+                minor: mem.u16_le(address + 2).ok()?,
             })
         })
         // TODO 4.0 can false positive so ignore it. need to harden if this is to work on 4.0 games
         .filter(|ver| plausible(ver) && !(ver.major == 4 && ver.minor == 0))
-        .collect()
 }
 
-async fn scan_engine_version_string(ctx: &AsyncContext<'_>) -> Vec<EngineVersion> {
+fn engine_version_string() -> VersionMatcher {
     // wide "<digit>.<digit(s)>." at the start of a string, i.e. preceded by the NUL terminating whatever came before it
     let patterns = [
         "00 00 | 0011???? 00 2E 00 0011???? 00 2E 00",
         "00 00 | 0011???? 00 2E 00 0011???? 00 0011???? 00 2E 00",
     ];
-    let res = scan_patterns(ctx, patterns).await;
-
-    let mem = &ctx.image().memory;
-    res.iter()
-        .filter_map(|&a| {
-            let s = mem.read_wstring(a).ok()?;
+    BinaryMatcher::patterns(patterns)
+        .expect("valid version-string patterns")
+        .with_context()
+        .map_filter(|(ctx, node)| {
+            let s = ctx.image().memory.read_wstring(*node.value).ok()?;
             let (major, rest) = s.split_once('.')?;
             let (minor, rest) = rest.split_once('.')?;
             let (patch, build_version) = rest.split_once('-')?;
@@ -196,32 +199,23 @@ async fn scan_engine_version_string(ctx: &AsyncContext<'_>) -> Vec<EngineVersion
                 minor: minor.parse().ok()?,
             })
         })
-        .filter(plausible)
-        .collect()
+        .filter(|node| plausible(node))
 }
 
-async fn scan_branch_name(ctx: &AsyncContext<'_>) -> Vec<EngineVersion> {
+fn branch_name() -> VersionMatcher {
     const BRANCHES: &[&str] = &["++UE4+Release-", "++UE5+Release-", "++depot+UE4-Releases+"];
-    let res = join_all(
-        BRANCHES
-            .iter()
-            .map(|b| async move { (b.len(), scan(ctx, util::utf16_pattern(b)).await) }),
-    )
-    .await;
-
-    let mem = &ctx.image().memory;
-    res.iter()
-        .flat_map(|(prefix, addresses)| addresses.iter().map(move |a| (*prefix, *a)))
-        .filter_map(|(prefix, a)| {
-            let s = mem.read_wstring(a).ok()?;
-            let version = s.get(prefix..)?;
+    BinaryMatcher::patterns(BRANCHES.iter().map(|branch| util::utf16_pattern(branch)))
+        .expect("literal branch patterns")
+        .with_context()
+        .map_filter(|(ctx, node)| {
+            let s = ctx.image().memory.read_wstring(*node.value).ok()?;
+            let version = BRANCHES.iter().find_map(|prefix| s.strip_prefix(prefix))?;
             // trailing junk is expected, e.g. "++UE4+Release-4.25Plus"
             let (major, rest) = split_number(version)?;
             let (minor, _) = split_number(rest.strip_prefix('.')?)?;
             Some(EngineVersion { major, minor })
         })
-        .filter(plausible)
-        .collect()
+        .filter(|node| plausible(node))
 }
 
 fn split_number(s: &str) -> Option<(u16, &str)> {
@@ -230,23 +224,27 @@ fn split_number(s: &str) -> Option<(u16, &str)> {
 }
 
 impl_resolver!(all, EngineVersion, |ctx| async {
+    let strings = engine_version_string().ensure_one();
+    let stores = version_stores().ensure_one();
+    let patterns = version_pattern_matches().ensure_one();
+    let branches = branch_name().ensure_one();
     let (version_string, stores, patterns, branch_name) = futures::join!(
-        scan_engine_version_string(ctx),
-        scan_version_stores(ctx),
-        scan_version_pattern_matches(ctx),
-        scan_branch_name(ctx),
+        strings.resolve(ctx),
+        stores.resolve(ctx),
+        patterns.resolve(ctx),
+        branches.resolve(ctx),
     );
 
-    let patterns = ensure_one(patterns);
+    let patterns = patterns.and_then(into_value);
     for candidates in [version_string, stores] {
-        if let Ok(version) = ensure_one(candidates) {
+        if let Ok(version) = candidates.and_then(into_value) {
             return Ok(version);
         }
     }
     if patterns.is_ok() {
         return patterns;
     }
-    ensure_one(branch_name).or(patterns)
+    branch_name.and_then(into_value).or(patterns)
 });
 
 /// currently seems to be 4.22+
@@ -254,34 +252,27 @@ pub use super::models::version::EngineVersionStrings;
 impl_resolver!(collect, EngineVersionStrings);
 // "++UE5+Release-{}.{}"
 impl_resolver!(ElfImage, EngineVersionStrings, |ctx| async {
-    use patternsleuth::resolvers::ensure_one;
+    let names = BinaryMatcher::pattern(util::utf16_pattern("++UE5+Release-"))
+        .with_context()
+        .map_filter(|(ctx, node)| ctx.image().memory.read_wstring(*node.value).ok())
+        .try_transform(|nodes| {
+            if nodes.len() != 2 {
+                bail_out!("not found");
+            }
+            let mut names: Vec<_> = nodes.iter().map(|node| node.value.as_str()).collect();
+            names.sort();
+            Ok((names[0].to_owned(), names[1].to_owned()))
+        });
 
-    let pattern_name = util::utf16_pattern("++UE5+Release-");
-    let name_scan = scan(ctx, pattern_name).await;
-
-    let mut name_scan: Vec<_> = name_scan
-        .iter()
-        .flat_map(|&addr| ctx.image().memory.read_wstring(addr))
-        .collect();
-
-    if name_scan.len() != 2 {
-        bail_out!("not found");
-    }
-
-    name_scan.sort();
-    let (branch_name, build_version) = (name_scan[0].clone(), name_scan[1].clone());
-
-    let build_date = join_all(
+    let build_date = BinaryMatcher::patterns(
         [
             "Jan ", "Feb ", "Mar ", "Apr ", "May ", "Jun ", "Jul ", "Aug ", "Sep ", "Oct ", "Nov ",
             "Dec ",
         ]
-        .map(|p| scan(ctx, util::utf16_pattern(p))),
-    )
-    .await
-    .into_iter()
-    .flatten()
-    .flat_map(|addr| ctx.image().memory.read_wstring(addr))
+        .map(util::utf16_pattern),
+    )?
+    .with_context()
+    .map_filter(|(ctx, node)| ctx.image().memory.read_wstring(*node.value).ok())
     .filter(|p| {
         let sp = p.split_whitespace().collect_vec();
         if sp.len() == 3 {
@@ -293,15 +284,22 @@ impl_resolver!(ElfImage, EngineVersionStrings, |ctx| async {
         } else {
             false
         }
-    });
-
-    let build_date = ensure_one(build_date)?;
-
-    Ok(Self {
-        branch_name,
-        build_date,
-        build_version,
     })
+    .ensure_one();
+
+    names
+        .fork(build_date)
+        .map(|node| {
+            let (branch_name, build_version) = node.value.0.value.as_ref();
+            Self {
+                branch_name: branch_name.clone(),
+                build_date: node.value.1.value.as_ref().clone(),
+                build_version: build_version.clone(),
+            }
+        })
+        .resolve(ctx)
+        .await
+        .and_then(into_value)
 });
 
 impl_resolver!(PEImage, EngineVersionStrings, |ctx| async {
@@ -312,15 +310,6 @@ impl_resolver!(PEImage, EngineVersionStrings, |ctx| async {
         "48 8D 05 [ ?? ?? ?? ?? ] C3 CC CC CC CC CC CC CC CC 48 8D 05 [ ?? ?? ?? ?? ] C3 CC CC CC CC CC CC CC CC 48 8D 05 [ ?? ?? ?? ?? ] C3 CC CC CC CC CC CC CC CC",
     ];
 
-    let res = join_all(
-        patterns
-            .iter()
-            .map(|p| scan_tagged(ctx, (), Pattern::new(p).unwrap())),
-    )
-    .await;
-
-    let mem = &ctx.image().memory;
-
     let months = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ]
@@ -328,26 +317,32 @@ impl_resolver!(PEImage, EngineVersionStrings, |ctx| async {
     .map(|month| month.encode_utf16().flat_map(u16::to_le_bytes).collect())
     .collect::<HashSet<Vec<u8>>>();
 
-    for (_, pattern, addresses) in res {
-        for a in addresses {
-            let caps = mem.captures(&pattern, a)?.unwrap();
-            let date = caps[1].rip();
-            if mem
-                .range(date..date + 6)
-                .ok()
-                .filter(|r| months.contains(&r[..]))
-                .is_some()
-            {
-                return Ok(EngineVersionStrings {
-                    branch_name: mem.read_wstring(caps[0].rip())?,
-                    build_date: mem.read_wstring(caps[1].rip())?,
-                    build_version: mem.read_wstring(caps[2].rip())?,
-                });
+    let pattern = Pattern::new(patterns[0]).unwrap();
+    BinaryMatcher::pattern(pattern.clone())
+        .with_context()
+        .try_transform(move |(ctx, nodes)| {
+            let mem = &ctx.image().memory;
+            for node in nodes {
+                let caps = mem.captures(&pattern, *node.value)?.unwrap();
+                let date = caps[1].rip();
+                if mem
+                    .range(date..date + 6)
+                    .ok()
+                    .filter(|r| months.contains(&r[..]))
+                    .is_some()
+                {
+                    return Ok(EngineVersionStrings {
+                        branch_name: mem.read_wstring(caps[0].rip())?,
+                        build_date: mem.read_wstring(caps[1].rip())?,
+                        build_version: mem.read_wstring(caps[2].rip())?,
+                    });
+                }
             }
-        }
-    }
-
-    bail_out!("not found");
+            bail_out!("not found");
+        })
+        .resolve(ctx)
+        .await
+        .and_then(into_value)
 });
 
 pub use super::models::custom_versions::CustomVersionRegistry;
@@ -390,80 +385,79 @@ impl_resolver!(all, StaticCustomVersions, |ctx| async {
         (V::F, "0f 10 05 [ ?? ?? ?? ?? ] 41 b8 01 00 00 00 48 8d 15 [ ?? ?? ?? ?? ] 48 8d 4c 24 40 0f 29 44 24 20 e8 ?? ?? ?? ?? 41 b8 [ ?? ?? ?? ?? ] 48"),
         (V::G, "0f 10 05 [ ?? ?? ?? ?? ] 41 b8 01 00 00 00 48 8d 15 [ ?? ?? ?? ?? ] 48 8d 4c 24 40 0f 29 44 24 20 e8 ?? ?? ?? ?? 45 33 c0 48 ?? ?? ?? ?? 48"),
     ];
-    let res = join_all(
-        patterns
-            .iter()
-            .map(|(v, p)| scan_tagged(ctx, v, Pattern::new(p).unwrap())),
-    )
-    .await;
+    let patterns = patterns
+        .into_iter()
+        .map(|(variant, signature)| (variant, Pattern::new(signature).unwrap()))
+        .collect();
+    Matcher::items::<(V, Pattern)>()
+        .flat_map(|source| BinaryMatcher::pattern(source.value.1.clone()))
+        .ensure_non_empty()
+        .with_context()
+        .try_transform(|(ctx, nodes)| {
+            let mut versions = BTreeSet::new();
+            let mem = &ctx.image().memory;
+            for node in nodes {
+                let (v, pattern) = node.parent().outer.value.as_ref();
+                let caps = mem.captures(pattern, *node.value)?.unwrap();
 
-    let mut versions = BTreeSet::new();
-
-    let mem = &ctx.image().memory;
-
-    for (v, pattern, addresses) in res {
-        for a in addresses {
-            let caps = mem.captures(&pattern, a)?.unwrap();
-
-            match v {
-                V::A => {
-                    versions.insert(CustomVersion {
-                        guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
-                        version: caps[2].data[0] as u32,
-                        name: mem.read_wstring(caps[1].rip())?,
-                    });
-                }
-                V::B => {
-                    versions.insert(CustomVersion {
-                        guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
-                        version: 0,
-                        name: mem.read_wstring(caps[1].rip())?,
-                    });
-                }
-                V::C => {
-                    versions.insert(CustomVersion {
-                        guid: Guid(mem.array(caps[1].rip()).unwrap_or_default()),
-                        version: 0,
-                        name: mem.read_wstring(caps[0].rip())?,
-                    });
-                }
-                V::D => {
-                    versions.insert(CustomVersion {
-                        guid: Guid(mem.array(caps[1].rip()).unwrap_or_default()),
-                        version: caps[2].u32(),
-                        name: mem.read_wstring(caps[0].rip())?,
-                    });
-                }
-                V::E => {
-                    versions.insert(CustomVersion {
-                        guid: Guid(mem.array(caps[1].rip()).unwrap_or_default()),
-                        version: 0,
-                        name: mem.read_wstring(caps[0].rip())?,
-                    });
-                }
-                V::F => {
-                    versions.insert(CustomVersion {
-                        guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
-                        version: caps[2].u32(),
-                        name: mem.read_wstring(caps[1].rip())?,
-                    });
-                }
-                V::G => {
-                    versions.insert(CustomVersion {
-                        guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
-                        version: 0,
-                        name: mem.read_wstring(caps[1].rip())?,
-                    });
+                match v {
+                    V::A => {
+                        versions.insert(CustomVersion {
+                            guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
+                            version: caps[2].data[0] as u32,
+                            name: mem.read_wstring(caps[1].rip())?,
+                        });
+                    }
+                    V::B => {
+                        versions.insert(CustomVersion {
+                            guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
+                            version: 0,
+                            name: mem.read_wstring(caps[1].rip())?,
+                        });
+                    }
+                    V::C => {
+                        versions.insert(CustomVersion {
+                            guid: Guid(mem.array(caps[1].rip()).unwrap_or_default()),
+                            version: 0,
+                            name: mem.read_wstring(caps[0].rip())?,
+                        });
+                    }
+                    V::D => {
+                        versions.insert(CustomVersion {
+                            guid: Guid(mem.array(caps[1].rip()).unwrap_or_default()),
+                            version: caps[2].u32(),
+                            name: mem.read_wstring(caps[0].rip())?,
+                        });
+                    }
+                    V::E => {
+                        versions.insert(CustomVersion {
+                            guid: Guid(mem.array(caps[1].rip()).unwrap_or_default()),
+                            version: 0,
+                            name: mem.read_wstring(caps[0].rip())?,
+                        });
+                    }
+                    V::F => {
+                        versions.insert(CustomVersion {
+                            guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
+                            version: caps[2].u32(),
+                            name: mem.read_wstring(caps[1].rip())?,
+                        });
+                    }
+                    V::G => {
+                        versions.insert(CustomVersion {
+                            guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
+                            version: 0,
+                            name: mem.read_wstring(caps[1].rip())?,
+                        });
+                    }
                 }
             }
-        }
-    }
 
-    if versions.is_empty() {
-        Err(ResolveError::new_msg("expected at least one value"))
-    } else {
-        Ok(Self(versions))
-    }
+            Ok(Self(versions))
+        })
+        .run(patterns, ctx)
+        .await
+        .and_then(into_value)
 });
 
 /// Build changelist version string (e.g., "main-CL-89524" or "++UE4+Release-4.22-CL-0")
@@ -479,110 +473,101 @@ impl_resolver!(all, BuildChangeList, |ctx| async {
         "e8 [ ?? ?? ?? ?? ] 4c 8b c0 48 8d 15 [ ?? ?? ?? ?? ] 48 8d ?? ?? e8",
     ];
 
-    // Find all "Build: %s" strings
-    let build_pattern_str = util::utf16_pattern("Build: %s");
-    let build_str_addrs: BTreeSet<_> = scan(ctx, build_pattern_str).await.into_iter().collect();
+    BinaryMatcher::pattern(util::utf16_pattern("Build: %s"))
+        .ensure_non_empty()
+        .transform(|nodes| {
+            nodes
+                .iter()
+                .map(|node| *node.value)
+                .collect::<BTreeSet<_>>()
+        })
+        .flat_map(move |anchors| {
+            let anchors = Arc::clone(&anchors.value);
+            Matcher::from_sync(move |()| {
+                Ok(patterns
+                    .map(|signature| Pattern::new(signature).unwrap())
+                    .to_vec())
+            })
+            .flat_map(|source| BinaryMatcher::pattern(source.value.as_ref().clone()))
+            .with_context()
+            .try_transform(move |(ctx, nodes)| {
+                let mem = &ctx.image().memory;
+                let img = ctx.image();
+                for node in nodes {
+                    let pattern = node.parent().outer.value.as_ref();
+                    let caps = mem.captures(pattern, *node.value)?.unwrap();
 
-    if build_str_addrs.is_empty() {
-        bail_out!("'Build: %s' string not found");
-    }
+                    // Check if caps[1] (the lea rdx offset) points to a "Build: %s" string
+                    if anchors.contains(&caps[1].rip()) {
+                        let call_target = caps[0].rip();
+                        let mut result: Option<String> = None;
+                        let mut num_inst = 0;
 
-    let mem = &ctx.image().memory;
-    let img = ctx.image();
+                        disassemble(img, call_target, |inst| {
+                            // Look for lea reg, [rip+offset]
+                            if matches!(inst.code(), Code::Lea_r64_m | Code::Lea_r32_m)
+                                && inst.memory_base() == Register::RIP
+                                && inst.op1_kind() == OpKind::Memory
+                                && let Ok(s) = mem.read_wstring(inst.ip_rel_memory_address())
+                            {
+                                result = Some(s);
+                                return Ok(Control::Exit);
+                            }
 
-    let res = join_all(
-        patterns
-            .iter()
-            .map(|p| scan_tagged(ctx, (), Pattern::new(p).unwrap())),
-    )
-    .await;
+                            num_inst += 1;
+                            if num_inst > 100 {
+                                Ok(Control::Exit)
+                            } else {
+                                // depth first
+                                Ok(Control::Follow)
+                            }
+                        })?;
 
-    for (_, pattern, addresses) in res {
-        for a in addresses {
-            let caps = mem.captures(&pattern, a)?.unwrap();
-
-            // Check if caps[1] (the lea rdx offset) points to a "Build: %s" string
-            if build_str_addrs.contains(&caps[1].rip()) {
-                let call_target = caps[0].rip();
-                let mut result: Option<String> = None;
-                let mut num_inst = 0;
-
-                disassemble(img, call_target, |inst| {
-                    // Look for lea reg, [rip+offset]
-                    if matches!(inst.code(), Code::Lea_r64_m | Code::Lea_r32_m)
-                        && inst.memory_base() == Register::RIP
-                        && inst.op1_kind() == OpKind::Memory
-                        && let Ok(s) = mem.read_wstring(inst.ip_rel_memory_address())
-                    {
-                        result = Some(s);
-                        return Ok(Control::Exit);
+                        if let Some(s) = result {
+                            return Ok(BuildChangeList(s));
+                        }
                     }
-
-                    num_inst += 1;
-                    if num_inst > 100 {
-                        Ok(Control::Exit)
-                    } else {
-                        // depth first
-                        Ok(Control::Follow)
-                    }
-                })?;
-
-                if let Some(s) = result {
-                    return Ok(BuildChangeList(s));
                 }
-            }
-        }
-    }
-
-    bail_out!("Build changelist not found");
+                bail_out!("Build changelist not found");
+            })
+        })
+        .first()
+        .resolve(ctx)
+        .await
+        .and_then(into_value)
 });
 
 /// InternalProjectName. GInternalProjectName in UE code, compiled_in_project_name will be unset if executable is a game agnostic executable
 pub use super::models::build::InternalProjectName;
 impl_resolver!(all, InternalProjectName, |ctx| async {
-    let strings = join_all([
-        scan(ctx, util::utf16_pattern("UE4-%s\0")), // UE4
-        scan(ctx, util::utf16_pattern("UE-%s\0")),  // UE5
-    ])
-    .await
-    .into_iter()
-    .flatten()
-    .collect_vec();
-
     // Old UE4 games have UE4-%s literal in 2 places, once in FGenericCrashContext and once in legacy WER crash report handler
-    let patterns = strings
-        .into_iter()
-        .flat_map(|str_addr| {
-            [
+    BinaryMatcher::patterns(["UE4-%s\0", "UE-%s\0"].map(util::utf16_pattern))?
+        .try_flat_map(|node| {
+            let str_addr = *node.value;
+            BinaryMatcher::patterns([
         format!("4c 8d 05 | ?? ?? ?? ?? 48 8d 15 X0x{str_addr:08x} 48 8d 4c 24 ?? e8"), // no frame pointer
         format!("4c 8d 05 | ?? ?? ?? ?? 48 8d 15 X0x{str_addr:08x} 48 8d 4d ?? e8"), // frame pointer
         format!("4c 8d 05 | ?? ?? ?? ?? 88 05 ?? ?? ?? ?? 48 8d 15 X0x{str_addr:08x} 48 8d 4d ?? e8"), // frame pointer/legacy (has mov [rip+123], al in the middle of function register filling)
         format!("4c 8d 0d | ?? ?? ?? ?? 4c 8d 05 X0x{str_addr:08x} 48 8d 4c 24 ?? ba 00 04 00 00"), // frame pointer/legacy WER crash reporter
         format!("4c 8d 0d | ?? ?? ?? ?? ba 00 04 00 00 4c 8d 05 X0x{str_addr:08x} 48 8b d8 48 8d 4c 24"), // another variation of legacy WER crash reporter with slightly different argument ordering
-    ].into_iter()
+     ])
         })
-        .collect_vec();
-    let internal_project_name = BinaryMatcher::patterns(patterns)?
         .rip4()
         .ensure_one()
-        .resolve(ctx)
-        .await?;
-    let internal_project_name = *internal_project_name.value;
-    let is_bss_section = ctx
-        .image()
-        .memory
-        .get_section_containing(internal_project_name)
-        .map(|x| x.kind().is_bss())
-        .unwrap_or(true);
-    let compiled_in_project_name = if !is_bss_section {
-        Some(ctx.image().memory.read_wstring(internal_project_name)?)
-    } else {
-        None
-    };
-    Ok(Self {
-        internal_project_name,
-        compiled_in_project_name,
-    })
+        .with_context()
+        .try_map(|(ctx, node)| {
+            let internal_project_name = *node.value;
+            let memory = &ctx.image().memory;
+            let is_bss_section = memory.get_section_containing(internal_project_name)
+                .map(|section| section.kind().is_bss()).unwrap_or(true);
+            let compiled_in_project_name = if is_bss_section {
+                None
+            } else {
+                Some(memory.read_wstring(internal_project_name)?)
+            };
+            Ok(Self { internal_project_name, compiled_in_project_name })
+        })
+        .resolve(ctx).await.and_then(into_value)
 });
 
 const fn v(major: u16, minor: u16) -> EngineVersion {
@@ -971,43 +956,107 @@ fn resolve_axis<T: PartialEq>(
     Ok(value)
 }
 
-async fn fingerprint(ctx: &AsyncContext<'_>) -> patternsleuth::resolvers::Result<Vec<usize>> {
-    let found = join_all(
-        MARKERS
-            .iter()
-            .map(|m| scan(ctx, util::utf16_pattern(m.string))),
-    )
-    .await;
-    let present = found.iter().map(|a| !a.is_empty()).collect_vec();
-    if present.iter().filter(|p| **p).count() < MIN_MARKERS_PRESENT {
-        bail_out!("too few marker strings to fingerprint");
-    }
-    Ok(costs(&present))
+fn fingerprint() -> Matcher<'static, (), Vec<usize>, ExactlyOne, impl Send + Sync> {
+    Matcher::from_sync(|()| Ok(MARKERS.iter().collect::<Vec<_>>()))
+        .flat_map(|marker| {
+            BinaryMatcher::pattern(util::utf16_pattern(marker.value.string))
+                .transform(|addresses| !addresses.is_empty())
+        })
+        .try_transform(|nodes| {
+            let present = nodes.iter().map(|node| *node.value).collect_vec();
+            if present.iter().filter(|present| **present).count() < MIN_MARKERS_PRESENT {
+                bail_out!("too few marker strings to fingerprint");
+            }
+            Ok(costs(&present))
+        })
 }
 
 pub use super::models::version::EngineVersionFingerprint;
 
 impl_resolver!(all, EngineVersionFingerprint, |ctx| async {
-    let costs = fingerprint(ctx).await?;
-    let Some(version) = resolve_axis(&costs, |build| build.version.cloned(), "version")? else {
-        bail_out!("predates the oldest fingerprinted version");
-    };
-    Ok(Self(version))
+    fingerprint()
+        .try_map(|costs| {
+            let Some(version) = resolve_axis(costs, |build| build.version.cloned(), "version")?
+            else {
+                bail_out!("predates the oldest fingerprinted version");
+            };
+            Ok(Self(version))
+        })
+        .resolve(ctx)
+        .await
+        .and_then(into_value)
 });
 
 impl_resolver!(all, BuildConfiguration, |ctx| async {
-    let costs = fingerprint(ctx).await?;
-    resolve_axis(&costs, |build| build.config, "build configuration")
+    fingerprint()
+        .try_map(|costs| resolve_axis(costs, |build| build.config, "build configuration"))
+        .resolve(ctx)
+        .await
+        .and_then(into_value)
 });
 
 impl_resolver!(all, Stats, |ctx| async {
-    let costs = fingerprint(ctx).await?;
-    resolve_axis(&costs, |build| build.stats, "stats setting")
+    fingerprint()
+        .try_map(|costs| resolve_axis(costs, |build| build.stats, "stats setting"))
+        .resolve(ctx)
+        .await
+        .and_then(into_value)
 });
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn version_string_pipeline_retains_the_scanned_address() {
+        let image = crate::ue::tests::image(util::utf16("\05.3.2-123+branch\0"));
+        let node = patternsleuth::resolvers::eval(&image, |ctx| {
+            Box::pin(async move { engine_version_string().ensure_one().resolve(ctx).await })
+        })
+        .unwrap();
+
+        assert_eq!(*node.value, v(5, 3));
+        assert_eq!(*node.parent().value, 0x1002);
+    }
+
+    #[test]
+    fn fingerprint_pipeline_resolves_all_three_axes() {
+        let version = VERSIONS
+            .iter()
+            .find(|version| **version == v(5, 3))
+            .unwrap();
+        let build = Build {
+            version: Some(version),
+            config: BuildConfiguration::Development,
+            stats: Stats::On,
+        };
+        let mut bytes = Vec::new();
+        for marker in MARKERS.iter().filter(|marker| marker.covers(&build)) {
+            bytes.extend(util::utf16(marker.string));
+            bytes.extend([0, 0]);
+        }
+        let image = crate::ue::tests::image(bytes);
+        let version = image.resolve(EngineVersionFingerprint::resolver()).unwrap();
+        let config = image.resolve(BuildConfiguration::resolver()).unwrap();
+        let stats = image.resolve(Stats::resolver()).unwrap();
+
+        assert_eq!(version.0, v(5, 3));
+        assert_eq!(config, build.config);
+        assert_eq!(stats, build.stats);
+    }
+
+    #[test]
+    fn fingerprint_pipeline_rejects_too_few_markers() {
+        let image = crate::ue::tests::image(Vec::new());
+        let error = image
+            .resolve(EngineVersionFingerprint::resolver())
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "EngineVersionFingerprint: too few marker strings to fingerprint"
+        );
+    }
 
     #[test]
     fn fingerprint_table_is_well_formed() {
