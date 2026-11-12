@@ -485,6 +485,57 @@ fn expansions_share_one_immutable_parent_without_cloning_its_value() {
 }
 
 #[test]
+fn context_expansion_preserves_order_after_empty_emissions() {
+    struct Source(u64);
+    let matcher = Matcher::items::<Source>()
+        .with_context()
+        .expand(|(ctx, node)| {
+            if node.value.0 == 0 {
+                Vec::new()
+            } else {
+                vec![ctx.image().base_address + node.value.0; 2]
+            }
+        });
+    let nodes = run_nodes(
+        &scan_image(),
+        matcher,
+        vec![Source(2), Source(0), Source(1)],
+    )
+    .unwrap();
+
+    assert_eq!(
+        nodes.iter().map(|node| *node.value).collect::<Vec<_>>(),
+        [BASE + 2, BASE + 2, BASE + 1, BASE + 1]
+    );
+    assert_eq!(nodes[0].parent().value.0, 2);
+    assert_eq!(nodes[2].parent().value.0, 1);
+    assert!(std::sync::Arc::ptr_eq(
+        &nodes[0].parents()[0],
+        &nodes[1].parents()[0]
+    ));
+    assert!(!std::sync::Arc::ptr_eq(
+        &nodes[0].parents()[0],
+        &nodes[2].parents()[0]
+    ));
+}
+
+#[test]
+fn fallible_context_expansion_stops_after_the_first_error() {
+    let matcher = BinaryMatcher::candidates([0, 1, 2, 3])
+        .with_context()
+        .try_expand(|(_, node)| match *node.value {
+            0 => Ok(Vec::new()),
+            1 => Ok(vec![1, 1]),
+            2 => Err(ResolveError::new_msg("expansion failed")),
+            _ => panic!("error must skip later candidates"),
+        })
+        .map(|_| -> u64 { panic!("error must skip downstream transformations") });
+    let error = run_nodes(&scan_image(), matcher, ()).unwrap_err();
+
+    assert_eq!(error.to_string(), "expansion failed");
+}
+
+#[test]
 fn optional_maps_drop_values_without_losing_surviving_parents() {
     let matcher = BinaryMatcher::candidates([1, 2, 3])
         .map_filter(|node| (*node.value != 2).then_some(*node.value * 10));

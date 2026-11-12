@@ -25,15 +25,7 @@ impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope,
     where
         F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<U> + Send + Sync + 'scope,
     {
-        self.matcher.transform_nodes(move |(ctx, nodes)| {
-            nodes
-                .into_iter()
-                .map(|node| {
-                    let value = func((ctx, &node))?;
-                    Ok(Trace::child(value, Arc::new(node)))
-                })
-                .collect()
-        })
+        self.try_expand_values(move |input| Ok([func(input)?]))
     }
     pub fn map_filter<U: Send + Sync + 'scope, F>(
         self,
@@ -51,15 +43,7 @@ impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope,
     where
         F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<Option<U>> + Send + Sync + 'scope,
     {
-        self.matcher.transform_nodes(move |(ctx, nodes)| {
-            let mut result = Vec::new();
-            for node in nodes {
-                if let Some(value) = func((ctx, &node))? {
-                    result.push(Trace::child(value, Arc::new(node)));
-                }
-            }
-            Ok(result)
-        })
+        self.try_expand_values(func)
     }
     pub fn filter_modify<U: Send + Sync + 'scope, F>(
         self,
@@ -85,6 +69,16 @@ impl<'scope, I: Send + 'scope, O: Send + Sync + 'scope, P: Send + Sync + 'scope,
     ) -> Matcher<'scope, I, U, Variable, Trace<O, P>>
     where
         F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<Vec<U>> + Send + Sync + 'scope,
+    {
+        self.try_expand_values(func)
+    }
+
+    fn try_expand_values<U, D, V, F>(self, func: F) -> Matcher<'scope, I, U, D, Trace<O, P>>
+    where
+        U: Send + Sync + 'scope,
+        D: Cardinality,
+        V: IntoIterator<Item = U>,
+        F: Fn((MatchContext<'_, '_>, &Trace<O, P>)) -> Result<V> + Send + Sync + 'scope,
     {
         self.matcher.transform_nodes(move |(ctx, nodes)| {
             let mut result = Vec::new();
