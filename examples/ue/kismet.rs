@@ -1,16 +1,14 @@
 //! Original: <https://github.com/Jacoby6000/patternsleuth/blob/3de6cfae694a95db619eddb989f0e2a9c0891ac6/patternsleuth/src/resolvers/unreal/kismet.rs>
 
-use super::scan::scan_tagged;
-use binary_bloodhound::BinaryMatcher;
+use binary_bloodhound::{BinaryMatcher, Matcher};
 use futures::future::join_all;
 use iced_x86::{Decoder, DecoderOptions, Instruction};
-use patternsleuth::scanner::Pattern;
+#[cfg(feature = "image-pe")]
+use patternsleuth::resolvers::ensure_one;
 
 use patternsleuth::{
-    Addressable, MemoryTrait,
-    resolvers::{
-        Result, bail_out, ensure_one, impl_resolver, impl_resolver_singleton, try_ensure_one,
-    },
+    MemoryTrait,
+    resolvers::{Result, bail_out, impl_resolver, impl_resolver_singleton},
 };
 
 /// public: void __cdecl UObject::SkipFunction(struct FFrame &, void *const, class UFunction *)
@@ -209,23 +207,28 @@ impl_resolver!(all, FFrameStepViaExec, |ctx| async {
         "41 56 53 01001??? 83 ec 18 01001??? 89 d6 01001??? 89 f3 0f 57 c0 0f 29 04 ??100??? e8 ?? ?? ?? ?? 01001??? 83 7b 20 00 74 ?? 01001??? 8b 73 18 01001??? 89 e2 01001??? 89 df e8 [ ?? ?? ?? ?? ] eb ?? 01001??? 8b 93 88 00 00 00 01001??? 8b 42 20 01001??? 89 83 88 00 00 00 01001??? 89 e6 01001??? 89 df e8 [ ?? ?? ?? ?? ]",
     ];
 
-    let res = join_all(
-        patterns
-            .iter()
-            .map(|p| scan_tagged(ctx, (), Pattern::new(p).unwrap())),
-    )
+    let context: &patternsleuth::resolvers::AsyncContext<'_> = ctx;
+    let results = join_all(patterns.into_iter().map(|pattern| async move {
+        BinaryMatcher::capture_patterns([pattern])?
+            .try_map(|node| Ok((node.captures[0].rip4()?, node.captures[1].rip4()?)))
+            .ensure_one()
+            .resolve(context)
+            .await
+    }))
     .await;
 
-    ensure_one(
-        res.into_iter()
-            .flat_map(|(_, pattern, addresses)| -> Result<_> {
-                try_ensure_one(addresses.iter().map(|a| -> Result<_> {
-                    let caps = ctx.image().memory.captures(&pattern, *a)?.unwrap();
-                    Ok(FFrameStepViaExec {
-                        step: caps[0].rip(),
-                        step_explicit_property: caps[1].rip(),
-                    })
-                }))
-            }),
+    // Upstream discards failed or ambiguous signatures before comparing successes.
+    Matcher::from_nodes(
+        results
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>(),
     )
+    .ensure_one()
+    .resolve(ctx)
+    .await
+    .map(|node| Self {
+        step: node.value.0,
+        step_explicit_property: node.value.1,
+    })
 });
