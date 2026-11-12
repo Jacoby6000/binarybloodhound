@@ -31,6 +31,7 @@ mod navigation;
 mod nodes;
 mod pipeline;
 mod provenance;
+mod sets;
 mod sources;
 
 pub use cardinality::{Cardinality, ExactlyOne, Variable};
